@@ -5,6 +5,7 @@ edition = "2024"
 description = "Universal Bar/QR codes library"
 keywords = ["barcode", "qrcode", "ean", "code128", "pdf417"]
 categories = ["encoding", "no-std"]
+license = "MIT"
 
 [features]
 default = []
