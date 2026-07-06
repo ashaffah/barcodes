@@ -22,5 +22,9 @@ optional = true
 default-features = false
 features = ["png", "gif", "webp"]
 
+[[example]]
+name = "gen_all"
+required-features = ["image"]
+
 [package.metadata.docs.rs]
 all-features = true
