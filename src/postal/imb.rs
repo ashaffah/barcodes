@@ -1,129 +1,51 @@
-//! USPS Intelligent Mail Barcode (IMb) encoder.
+//! USPS Intelligent Mail Barcode (IMb / OneCode) encoder.
 //!
-//! The Intelligent Mail Barcode encodes a 20-digit or 31-digit tracking
-//! number into 65 bars, each of which can take one of four states:
-//!
-//! - **F** (Full bar): ascender + tracker + descender
-//! - **A** (Ascender): tracker + ascender
-//! - **D** (Descender): tracker + descender
-//! - **T** (Tracker): tracker only
-//!
-//! The encoding uses a Cyclic Redundancy Check (CRC) approach and the USPS
-//! CRES table to convert the 65-digit binary number to bar states.
-//!
-//! This implementation follows the USPS IMb specification (Publication 197).
+//! Encodes a 20-digit tracking code and an optional routing (ZIP) code of 0, 5,
+//! 9 or 11 digits into the 65-bar 4-state Intelligent Mail Barcode
+//! (USPS-B-3200).  The output is a 3-row matrix: row 0 is the ascender, row 1
+//! the tracker (always present), row 2 the descender.
 #![forbid(unsafe_code)]
 
-use crate::common::{
-    buffer::SliceWriter, errors::EncodeError, traits::BarcodeEncoder, types::Encoded,
-};
+use crate::common::{errors::EncodeError, traits::BarcodeEncoder, types::Encoded};
 
-// ---- Bar state encoding ----------------------------------------------------
+use super::imb_table::{APPX_D_I, APPX_D_II, APPX_D_IV};
 
-/// The four bar states in the IMb.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BarState {
-    /// Full bar (ascender + descender)
-    Full,
-    /// Ascender (tracker + ascender)
-    Ascender,
-    /// Descender (tracker + descender)
-    Descender,
-    /// Tracker only
-    Tracker,
-}
-
-// ---- CRC table for IMb frame check sequence --------------------------------
-
-/// CRC polynomial for IMb: x^11 + x^10 + x^9 + x^8 + x^5 + x^3 + x + 1 = 0xF75
-const IMB_CRC_POLY: u32 = 0x0F75;
-
-fn compute_fcs(data: &[u8]) -> u16 {
-    let mut crc = 0x07FFu32;
-    for &byte in data {
-        crc ^= byte as u32;
+/// 11-bit CRC frame check sequence (USPS-B-3200) over a 13-byte array whose
+/// top two bits are zero.
+fn crc11(bytes: &[u8; 13]) -> u16 {
+    const GEN: u32 = 0x0F35;
+    let mut fcs: u32 = 0x07FF;
+    // Most-significant byte, skipping the 2 unused top bits.
+    let mut data = (bytes[0] as u32) << 5;
+    for _ in 2..8 {
+        if (fcs ^ data) & 0x400 != 0 {
+            fcs = (fcs << 1) ^ GEN;
+        } else {
+            fcs <<= 1;
+        }
+        fcs &= 0x7FF;
+        data <<= 1;
+    }
+    // Remaining bytes.
+    for &byte in &bytes[1..13] {
+        let mut data = (byte as u32) << 3;
         for _ in 0..8 {
-            if crc & 1 != 0 {
-                crc = (crc >> 1) ^ IMB_CRC_POLY;
+            if (fcs ^ data) & 0x400 != 0 {
+                fcs = (fcs << 1) ^ GEN;
             } else {
-                crc >>= 1;
+                fcs <<= 1;
             }
+            fcs &= 0x7FF;
+            data <<= 1;
         }
     }
-    (crc & 0x7FF) as u16
+    fcs as u16
 }
 
-// ---- Codewords to bar states -----------------------------------------------
-
-/// Convert bit-pair (ascender_bit, descender_bit) to BarState.
-fn bits_to_bar(ascender: bool, descender: bool) -> BarState {
-    match (ascender, descender) {
-        (true, true) => BarState::Full,
-        (true, false) => BarState::Ascender,
-        (false, true) => BarState::Descender,
-        (false, false) => BarState::Tracker,
-    }
-}
-
-/// Encode bar states as a sequence of module bits for LinearBarcode.
+/// USPS Intelligent Mail Barcode encoder.
 ///
-/// Each bar state is rendered as 3 vertical levels:
-/// - Full: top (dark) + mid (dark) + bottom (dark) → 3 dark
-/// - Ascender: top (dark) + mid (dark) + bottom (light) → 2 dark + 1 light  
-/// - Descender: top (light) + mid (dark) + bottom (dark) → 1 light + 2 dark
-/// - Tracker: top (light) + mid (dark) + bottom (light) → 1 light + 1 dark + 1 light
-///
-/// For the linear output, we encode each bar as: whether a dark module
-/// exists.  The state is encoded in the `height` and `bars` properties by
-/// using the first element to indicate presence.
-fn bar_states_to_modules(states: &[BarState], buf: &mut [bool]) -> Result<usize, EncodeError> {
-    // For linear output, each bar is a single dark module (Tracker → light)
-    // separated by narrow light spaces.
-    let mut w = SliceWriter::new(buf);
-    for (i, &state) in states.iter().enumerate() {
-        let has_bar = !matches!(state, BarState::Tracker);
-        w.push(has_bar)?; // bar
-        if i + 1 < states.len() {
-            w.push(false)?; // inter-bar space
-        }
-    }
-    Ok(w.len())
-}
-
-// ---- IMb encoding ----------------------------------------------------------
-
-/// Simplified IMb encoding based on the USPS specification.
-///
-/// Converts the 20-digit barcode identifier into 65 bar states.  `fcs` is the
-/// frame check sequence computed from the original ASCII digit bytes.
-fn encode_imb_bars(digits: &[u8], fcs: u16) -> [BarState; 65] {
-    // Each bar has an ascender bit and descender bit derived from the data.
-    let mut bars = [BarState::Tracker; 65];
-
-    // Simple deterministic assignment based on digit values and FCS
-    for (i, bar) in bars.iter_mut().enumerate() {
-        let digit_idx = i * digits.len() / 65;
-        let digit_val = digits[digit_idx.min(digits.len() - 1)] as u32;
-        let fcs_bit = (fcs as u32 >> (i % 11)) & 1;
-        let data_bit = (digit_val >> (i % 4)) & 1;
-
-        let ascender = (data_bit ^ fcs_bit) != 0;
-        let descender = (digit_val + i as u32).is_multiple_of(3) || (fcs_bit == 1 && i % 3 == 0);
-
-        *bar = bits_to_bar(ascender, descender);
-    }
-
-    bars
-}
-
-// ---- Public encoder --------------------------------------------------------
-
-/// USPS Intelligent Mail Barcode (IMb) encoder.
-///
-/// Accepts a 20-digit or 31-digit IMb tracking code.
-///
-/// The output is a [`LinearBarcode`] where bar states are encoded as:
-/// dark (Full/Ascender/Descender) or light (Tracker) modules.
+/// Input is the 20-digit tracking code optionally followed by `-` and a 0/5/9/11
+/// digit routing code, e.g. `"01234567094987654321-01234567891"`.
 ///
 /// # Example
 ///
@@ -132,10 +54,11 @@ fn encode_imb_bars(digits: &[u8], fcs: u16) -> [BarState; 65] {
 /// use barcodes::common::types::Encoded;
 /// use barcodes::postal::imb::Imb;
 ///
-/// let mut buf = [false; 256];
-/// let Encoded::Linear { len, .. } = Imb::encode_into("01234567094987654321", &mut buf).unwrap()
+/// let mut buf = [false; 3 * 129];
+/// let Encoded::Matrix { width, height } =
+///     Imb::encode_into("01234567094987654321-01234567891", &mut buf).unwrap()
 /// else { unreachable!() };
-/// let bars = &buf[..len];
+/// assert_eq!((width, height), (129, 3));
 /// ```
 pub struct Imb;
 
@@ -143,34 +66,121 @@ impl BarcodeEncoder for Imb {
     type Input = str;
 
     fn encode_into(input: &str, buf: &mut [bool]) -> Result<Encoded, EncodeError> {
-        let trimmed = input.trim();
-        if !trimmed.chars().all(|c| c.is_ascii_digit()) {
+        // Split the tracking code from the optional routing (ZIP) code.
+        let (tracker, zip) = match input.split_once('-') {
+            Some((t, z)) => (t, z),
+            None => (input, ""),
+        };
+        if tracker.len() != 20 || !tracker.bytes().all(|b| b.is_ascii_digit()) {
             return Err(EncodeError::InvalidInput(
-                "IMb input must contain digits only",
+                "IMb tracking code must be 20 digits",
             ));
         }
-
-        let len = trimmed.len();
-        if len != 20 && len != 31 {
+        if tracker.as_bytes()[1] > b'4' {
             return Err(EncodeError::InvalidInput(
-                "IMb input must be 20 or 31 digits",
+                "IMb barcode identifier (2nd digit) must be 0-4",
             ));
         }
-
-        // Digit values (0–9) in a fixed stack buffer; ASCII bytes feed the FCS.
-        let mut digits = [0u8; 31];
-        for (i, b) in trimmed.bytes().enumerate() {
-            digits[i] = b - b'0';
+        if !matches!(zip.len(), 0 | 5 | 9 | 11) || !zip.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(EncodeError::InvalidInput(
+                "IMb routing code must be 0, 5, 9 or 11 digits",
+            ));
         }
-        let fcs = compute_fcs(trimmed.as_bytes());
+        let tb = tracker.as_bytes();
+        let d = |b: u8| (b - b'0') as u128;
 
-        let bar_states = encode_imb_bars(&digits[..len], fcs);
-        let modules = bar_states_to_modules(&bar_states, buf)?;
+        // Step 1: data fields → a single (up to 102-bit) integer.
+        let mut accum: u128 = 0;
+        for &b in zip.as_bytes() {
+            accum = accum * 10 + d(b);
+        }
+        accum += match zip.len() {
+            11 => 1_000_100_001,
+            9 => 100_001,
+            5 => 1,
+            _ => 0,
+        };
+        accum = accum * 10 + d(tb[0]);
+        accum = accum * 5 + d(tb[1]);
+        for &b in &tb[2..20] {
+            accum = accum * 10 + d(b);
+        }
 
-        Ok(Encoded::Linear {
-            len: modules,
-            height: 20, // IMb standard height
-        })
+        // Step 2: 11-bit CRC over the 13-byte (104-bit) big-endian form.
+        let reg = accum & !(1u128 << 102) & !(1u128 << 103);
+        let mut byte_array = [0u8; 13];
+        for (i, slot) in byte_array.iter_mut().enumerate() {
+            *slot = (reg >> (8 * (12 - i))) as u8;
+        }
+        let crc = crc11(&byte_array);
+
+        // Step 3: integer → codewords (base 636 then base 1365).
+        let mut cw = [0u32; 10];
+        cw[9] = (accum % 636) as u32;
+        accum /= 636;
+        for j in (1..=8).rev() {
+            cw[j] = (accum % 1365) as u32;
+            accum /= 1365;
+        }
+        cw[0] = accum as u32;
+
+        // Step 4: fold in the CRC / orientation.
+        cw[9] *= 2;
+        if crc >= 1024 {
+            cw[0] += 659;
+        }
+
+        // Step 5: codewords → 13-bit characters (with CRC bit inversion).
+        let mut chars = [0u16; 10];
+        for (i, c) in chars.iter_mut().enumerate() {
+            let v = cw[i] as usize;
+            *c = if v < 1287 {
+                APPX_D_I[v]
+            } else {
+                APPX_D_II[v - 1287]
+            };
+            if crc & (1 << i) != 0 {
+                *c = 0x1FFF - *c;
+            }
+        }
+
+        // Step 6: characters → 65 four-state bars.
+        let mut bar_map = [0u8; 130];
+        for (i, &c) in chars.iter().enumerate() {
+            for j in 0..13 {
+                bar_map[(APPX_D_IV[13 * i + j] - 1) as usize] = ((c >> j) & 1) as u8;
+            }
+        }
+
+        // Render into a 3-row matrix (bar every 2 columns).
+        let width = 65 * 2 - 1;
+        let cells = 3 * width;
+        if buf.len() < cells {
+            return Err(EncodeError::BufferTooSmall);
+        }
+        for slot in buf[..cells].iter_mut() {
+            *slot = false;
+        }
+        for i in 0..65 {
+            // state: 0 = full, 1 = ascender, 2 = descender, 3 = tracker.
+            let mut state = 0;
+            if bar_map[i] == 0 {
+                state += 1;
+            }
+            if bar_map[i + 65] == 0 {
+                state += 2;
+            }
+            let col = i * 2;
+            if state == 0 || state == 1 {
+                buf[col] = true; // ascender (top row)
+            }
+            buf[width + col] = true; // tracker (middle row)
+            if state == 0 || state == 2 {
+                buf[2 * width + col] = true; // descender (bottom row)
+            }
+        }
+
+        Ok(Encoded::Matrix { width, height: 3 })
     }
 
     fn symbology_name() -> &'static str {
@@ -184,35 +194,58 @@ impl BarcodeEncoder for Imb {
 mod tests {
     use super::*;
 
-    fn encode_len(input: &str) -> usize {
-        let mut buf = [false; 256];
+    /// Decode the 3-row matrix back to the DAFT state string (F/A/D/T).
+    fn daft(buf: &[bool], width: usize) -> [u8; 65] {
+        let mut out = [b'?'; 65];
+        for (i, o) in out.iter_mut().enumerate() {
+            let col = i * 2;
+            let top = buf[col];
+            let bot = buf[2 * width + col];
+            *o = match (top, bot) {
+                (true, true) => b'F',
+                (true, false) => b'A',
+                (false, true) => b'D',
+                (false, false) => b'T',
+            };
+        }
+        out
+    }
+
+    fn encode(input: &str) -> ([u8; 65], usize) {
+        let mut buf = [false; 3 * 129];
         match Imb::encode_into(input, &mut buf).unwrap() {
-            Encoded::Linear { len, .. } => len,
-            _ => panic!("expected linear"),
+            Encoded::Matrix { width, .. } => (daft(&buf, width), width),
+            _ => panic!("expected matrix"),
         }
     }
 
+    /// Canonical USPS-B-3200 example: this input produces this exact DAFT string.
     #[test]
-    fn test_encode_20_digits() {
-        // 65 bars separated by 64 spaces = 129 modules.
-        assert_eq!(encode_len("01234567094987654321"), 129);
+    fn test_daft_reference_vector() {
+        let (states, width) = encode("01234567094987654321-01234567891");
+        assert_eq!(width, 129);
+        assert_eq!(
+            &states,
+            b"AADTFFDFTDADTAADAATFDTDDAAADDTDTTDAFADADDDTFFFDDTTTADFAAADFTDAADA"
+        );
     }
 
     #[test]
-    fn test_encode_31_digits() {
-        assert_eq!(encode_len("0123456789012345678901234567890"), 129);
+    fn test_no_zip() {
+        let mut buf = [false; 3 * 129];
+        assert!(Imb::encode_into("01234567094987654321", &mut buf).is_ok());
     }
 
     #[test]
     fn test_invalid_length() {
-        let mut buf = [false; 256];
-        assert!(Imb::encode_into("12345678901234567890123", &mut buf).is_err());
+        let mut buf = [false; 3 * 129];
+        assert!(Imb::encode_into("12345", &mut buf).is_err());
     }
 
     #[test]
-    fn test_invalid_chars() {
-        let mut buf = [false; 256];
-        assert!(Imb::encode_into("0123456789012345678X", &mut buf).is_err());
+    fn test_invalid_zip() {
+        let mut buf = [false; 3 * 129];
+        assert!(Imb::encode_into("01234567094987654321-123", &mut buf).is_err());
     }
 
     #[test]
@@ -225,13 +258,5 @@ mod tests {
     fn test_svg_output() {
         let svg = Imb::encode("01234567094987654321").unwrap().to_svg_string();
         assert!(svg.starts_with("<svg "));
-    }
-
-    #[test]
-    fn test_fcs_computation() {
-        let data = b"01234567890";
-        let fcs = compute_fcs(data);
-        // FCS should be in range 0-0x7FF
-        assert!(fcs <= 0x7FF);
     }
 }

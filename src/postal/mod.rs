@@ -5,4 +5,5 @@
 #![forbid(unsafe_code)]
 
 pub mod imb;
+mod imb_table;
 pub mod rm4scc;
