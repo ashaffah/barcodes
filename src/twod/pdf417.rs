@@ -23,14 +23,22 @@
 //! - Byte compaction (mode 901): binary data
 #![forbid(unsafe_code)]
 
-extern crate alloc;
-use alloc::{vec, vec::Vec};
-
 use crate::common::{
-    errors::EncodeError,
-    traits::BarcodeEncoder,
-    types::{BarcodeOutput, MatrixBarcode},
+    buffer::SliceWriter, errors::EncodeError, traits::BarcodeEncoder, types::Encoded,
 };
+
+// ---- Fixed capacity bounds -------------------------------------------------
+
+/// Maximum number of data columns.
+const MAX_COLS: usize = 30;
+/// Maximum number of rows.
+const MAX_ROWS: usize = 90;
+/// Maximum symbol codeword capacity (`MAX_ROWS * MAX_COLS`).
+const MAX_CAPACITY: usize = MAX_ROWS * MAX_COLS;
+/// Ceiling on the codeword array (capacity plus EC and descriptor slack).
+const MAX_CW: usize = MAX_CAPACITY + 16;
+/// Ceiling on error-correction codewords (level 2 → 8).
+const MAX_EC: usize = 16;
 
 // ---- Constants -------------------------------------------------------------
 
@@ -85,17 +93,18 @@ fn pdf417_encode_codeword(cluster: u32, c: u32) -> [u8; 8] {
     // This follows the PDF417 bar-count encoding algorithm
     let val = remaining + shift;
 
-    // Decompose into 4 bars with values 1-6 summing to part of 17
-    // The actual PDF417 algorithm is complex; we use a representative encoding
+    // Decompose into 4 bars with values 1-3 (bar_sum ≤ 12) so that the four
+    // spaces filling the remaining modules are always ≥ 1 and every codeword
+    // is a valid 17-module pattern (representative, constant-width encoding).
     let bars = [
-        ((val / 729) % 6 + 1) as u8,
-        ((val / 243) % 6 + 1) as u8,
-        ((val / 81) % 6 + 1) as u8,
-        ((val / 27) % 6 + 1) as u8,
+        ((val / 729) % 3 + 1) as u8,
+        ((val / 243) % 3 + 1) as u8,
+        ((val / 81) % 3 + 1) as u8,
+        ((val / 27) % 3 + 1) as u8,
     ];
     let bar_sum: u8 = bars[0] + bars[1] + bars[2] + bars[3];
 
-    // Spaces fill the remaining 17 modules
+    // Spaces fill the remaining 17 modules (bar_sum ≤ 12 ⇒ space_total ≥ 5).
     let space_total = 17u8.saturating_sub(bar_sum);
     let spaces = distribute_spaces(space_total);
 
@@ -131,14 +140,17 @@ fn distribute_spaces(total: u8) -> [u8; 4] {
 /// Compute PDF417 Reed-Solomon check codewords over GF(929).
 ///
 /// `level` determines the number of check codewords: 2^(level+1).
-fn rs_encode(data: &[u16], level: usize) -> Vec<u16> {
+/// Compute PDF417 RS check codewords into `out`, returning the EC count.
+fn rs_encode(data: &[u16], level: usize, out: &mut [u16]) -> usize {
     let ec_count = 1usize << (level + 1); // 2^(level+1)
 
-    // Generate the generator polynomial coefficients
-    let g = rs_generator(ec_count);
+    // Generate the generator polynomial coefficients (length ec_count + 1).
+    let mut g = [0u16; MAX_EC + 1];
+    rs_generator(ec_count, &mut g);
 
-    // Polynomial long division
-    let mut remainder: Vec<u32> = vec![0u32; ec_count];
+    // Polynomial long division.
+    let mut rem_buf = [0u32; MAX_EC];
+    let remainder = &mut rem_buf[..ec_count];
 
     for &d in data {
         let lead = (d as u32 + remainder[0]) % PDF417_PRIME;
@@ -154,25 +166,32 @@ fn rs_encode(data: &[u16], level: usize) -> Vec<u16> {
         }
     }
 
-    remainder.iter().rev().map(|&v| v as u16).collect()
+    for (o, &v) in out[..ec_count].iter_mut().zip(remainder.iter().rev()) {
+        *o = v as u16;
+    }
+    ec_count
 }
 
-/// Generate the RS generator polynomial coefficients for `k` check codewords.
-fn rs_generator(k: usize) -> Vec<u16> {
-    let mut g = vec![1u16; 1];
+/// Generate the RS generator polynomial coefficients for `k` check codewords
+/// into `out[..k + 1]`.
+fn rs_generator(k: usize, out: &mut [u16]) {
+    let mut g = [0u16; MAX_EC + 1];
+    g[0] = 1;
     for i in 0..k {
         // Multiply by (x - 3^i) in GF(929)
         let root = gf929_pow(3, i as u32);
-        let mut new_g = vec![0u16; g.len() + 1];
-        for (j, &gj) in g.iter().enumerate() {
+        let cur = i + 1; // current polynomial length before this multiply
+        let mut new_g = [0u16; MAX_EC + 1];
+        for j in 0..cur {
+            let gj = g[j];
             new_g[j] = (new_g[j] as u32 + gj as u32) as u16 % PDF417_PRIME as u16;
             new_g[j + 1] = (new_g[j + 1] as u32 + gj as u32 * (PDF417_PRIME - root) % PDF417_PRIME)
                 as u16
                 % PDF417_PRIME as u16;
         }
-        g = new_g;
+        g[..cur + 1].copy_from_slice(&new_g[..cur + 1]);
     }
-    g
+    out[..k + 1].copy_from_slice(&g[..k + 1]);
 }
 
 /// Compute 3^exp mod 929 (GF(929) primitive element).
@@ -192,34 +211,28 @@ fn gf929_pow(base: u32, exp: u32) -> u32 {
 
 // ---- Text compaction -------------------------------------------------------
 
-/// Encode ASCII text into PDF417 text compaction codewords.
-fn text_compaction(input: &str) -> Vec<u16> {
-    let bytes = input.as_bytes();
-    let mut sub_values: Vec<u8> = Vec::new();
-
-    // Text compaction: pairs of values (0-29) encoded as codeword = v1*30 + v2
-    for &b in bytes {
+/// Encode ASCII text into PDF417 text compaction codewords in `out`.
+///
+/// Text compaction pairs sub-values (0-29) into `v1*30 + v2` codewords.
+/// Returns the codeword count.
+fn text_compaction(input: &str, out: &mut [u16]) -> Result<usize, EncodeError> {
+    let mut n = 0;
+    let mut pending: Option<u8> = None;
+    for &b in input.as_bytes() {
         let sub = text_sub_value(b);
-        sub_values.push(sub);
+        if let Some(p) = pending.take() {
+            *out.get_mut(n).ok_or(EncodeError::DataTooLong)? = p as u16 * 30 + sub as u16;
+            n += 1;
+        } else {
+            pending = Some(sub);
+        }
     }
-
-    // Pad to even count
-    if !sub_values.len().is_multiple_of(2) {
-        sub_values.push(29); // pad character
+    // Pad an odd trailing sub-value with the pad character (29).
+    if let Some(p) = pending {
+        *out.get_mut(n).ok_or(EncodeError::DataTooLong)? = p as u16 * 30 + 29;
+        n += 1;
     }
-
-    let mut codewords: Vec<u16> = Vec::new();
-    // Mode switch to text compaction (mode 900)
-    // In text compaction mode, no mode indicator needed at start (it's the default)
-
-    let mut i = 0;
-    while i + 1 < sub_values.len() {
-        let cw = sub_values[i] as u16 * 30 + sub_values[i + 1] as u16;
-        codewords.push(cw);
-        i += 2;
-    }
-
-    codewords
+    Ok(n)
 }
 
 /// Map an ASCII byte to its PDF417 text compaction sub-value.
@@ -247,39 +260,28 @@ fn text_sub_value(b: u8) -> u8 {
 ///
 /// ```rust
 /// use barcodes::common::traits::BarcodeEncoder;
+/// use barcodes::common::types::Encoded;
 /// use barcodes::twod::pdf417::Pdf417;
 ///
-/// let out = Pdf417::encode("Hello, PDF417!").unwrap();
+/// let mut buf = [false; 4096];
+/// let Encoded::Matrix { width, height } = Pdf417::encode_into("Hello, PDF417!", &mut buf).unwrap()
+/// else { unreachable!() };
+/// assert!(height >= 3 && width > 0);
 /// ```
 pub struct Pdf417;
 
 impl BarcodeEncoder for Pdf417 {
     type Input = str;
-    type Error = EncodeError;
 
-    fn encode(input: &str) -> Result<BarcodeOutput, EncodeError> {
+    fn encode_into(input: &str, buf: &mut [bool]) -> Result<Encoded, EncodeError> {
         if input.is_empty() {
-            return Err(EncodeError::InvalidInput(
-                "PDF417 input must not be empty".into(),
-            ));
+            return Err(EncodeError::InvalidInput("PDF417 input must not be empty"));
         }
         if input.len() > 1850 {
             return Err(EncodeError::DataTooLong);
         }
 
-        let matrix = encode_pdf417(input, DEFAULT_EC_LEVEL)?;
-        let width = if matrix.is_empty() {
-            0
-        } else {
-            matrix[0].len()
-        };
-        let height = matrix.len();
-
-        Ok(BarcodeOutput::Matrix(MatrixBarcode {
-            modules: matrix,
-            width,
-            height,
-        }))
+        encode_pdf417(input, DEFAULT_EC_LEVEL, buf)
     }
 
     fn symbology_name() -> &'static str {
@@ -289,19 +291,23 @@ impl BarcodeEncoder for Pdf417 {
 
 // ---- Core encoding ---------------------------------------------------------
 
-fn encode_pdf417(input: &str, ec_level: usize) -> Result<Vec<Vec<bool>>, EncodeError> {
-    // Step 1: Encode data into codewords
-    let mut data_codewords = text_compaction(input);
+/// Width in modules of one PDF417 row: start(17) + left(17) + cols×17 +
+/// right(17) + stop(18) + termination bar(1).
+fn row_width(cols: usize) -> usize {
+    17 * (cols + 3) + 19
+}
 
-    // Step 2: Determine rows and columns
-    // Total codewords = data + EC
+fn encode_pdf417(input: &str, ec_level: usize, buf: &mut [bool]) -> Result<Encoded, EncodeError> {
+    // Step 1: Encode data into codewords.
+    let mut all_codewords = [0u16; MAX_CW];
+    let mut data_scratch = [0u16; MAX_CW];
+    let data_len = text_compaction(input, &mut data_scratch)?;
+
+    // Step 2: Determine rows and columns from the total codeword count.
     let ec_count = 1usize << (ec_level + 1);
-    let total_data = data_codewords.len();
-    let total_codewords = total_data + ec_count;
+    let total_codewords = data_len + ec_count;
 
-    // Choose number of columns (k) and rows (r) such that r×k ≈ total_codewords
-    // PDF417 allows 3-90 columns and 3-90 rows
-    // Integer square root approximation (no floating point needed)
+    // Integer square root (no floating point).
     let isqrt = {
         let n = total_codewords;
         if n == 0 {
@@ -316,67 +322,72 @@ fn encode_pdf417(input: &str, ec_level: usize) -> Result<Vec<Vec<bool>>, EncodeE
             x
         }
     };
-    let cols = isqrt.clamp(3, 30);
-    let rows = total_codewords.div_ceil(cols).clamp(3, 90);
+    let cols = isqrt.clamp(3, MAX_COLS);
+    let rows = total_codewords.div_ceil(cols).clamp(3, MAX_ROWS);
     let capacity = rows * cols;
 
-    // Pad data to fill the symbol
-    while data_codewords.len() < capacity - ec_count {
-        data_codewords.push(900); // text compaction mode indicator as pad
+    // Assemble: length descriptor + data padded to (capacity - ec_count).
+    let padded_data_len = (capacity - ec_count).max(data_len);
+    let mut n = 0;
+    all_codewords[n] = (total_codewords + 1) as u16; // length descriptor
+    n += 1;
+    all_codewords[n..n + data_len].copy_from_slice(&data_scratch[..data_len]);
+    n += data_len;
+    while n < 1 + padded_data_len {
+        all_codewords[n] = 900; // pad with text-compaction mode indicator
+        n += 1;
     }
 
-    // Length indicator = total number of codewords (including length indicator itself)
-    // Prepend the length/mode indicator
-    let mut all_codewords: Vec<u16> = Vec::with_capacity(capacity);
-    all_codewords.push((total_codewords + 1) as u16); // length descriptor
-    all_codewords.extend_from_slice(&data_codewords);
-
-    // Re-encode RS with the length descriptor
-    let ec_codewords = rs_encode(&all_codewords, ec_level);
-
-    while all_codewords.len() < capacity {
-        all_codewords.push(900);
+    // RS over the descriptor + data, then pad to capacity and append EC.
+    let mut ec_codewords = [0u16; MAX_EC];
+    let ec_n = rs_encode(&all_codewords[..n], ec_level, &mut ec_codewords);
+    while n < capacity {
+        all_codewords[n] = 900;
+        n += 1;
     }
-    all_codewords.extend_from_slice(&ec_codewords);
+    all_codewords[n..n + ec_n].copy_from_slice(&ec_codewords[..ec_n]);
 
-    // Step 4: Build the matrix
-    let mut matrix: Vec<Vec<bool>> = Vec::new();
+    // Step 4: Build the matrix by streaming rows into the caller buffer.
+    let width = row_width(cols);
+    if buf.len() < rows * width {
+        return Err(EncodeError::BufferTooSmall);
+    }
+    let mut w = SliceWriter::new(buf);
 
     for row_idx in 0..rows {
         let cluster = row_idx % 3; // clusters 0, 1, 2 (map to 0, 3, 6)
         let cluster_id = cluster * 3;
 
-        let mut row_bits: Vec<bool> = Vec::new();
-
         // Start pattern
-        append_pattern_bits(&mut row_bits, &START_PATTERN);
+        append_pattern_bits(&mut w, &START_PATTERN)?;
 
         // Left row indicator codeword
         let left_indicator = left_row_indicator(row_idx, rows, cols, ec_level, cluster);
-        append_codeword_bits(&mut row_bits, cluster_id, left_indicator);
+        append_codeword_bits(&mut w, cluster_id, left_indicator)?;
 
         // Data codewords for this row
         for col_idx in 0..cols {
             let cw_idx = row_idx * cols + col_idx;
-            let cw = if cw_idx < all_codewords.len() {
+            let cw = if cw_idx < capacity {
                 all_codewords[cw_idx]
             } else {
                 900 // padding
             };
-            append_codeword_bits(&mut row_bits, cluster_id, cw);
+            append_codeword_bits(&mut w, cluster_id, cw)?;
         }
 
         // Right row indicator codeword
         let right_indicator = right_row_indicator(row_idx, rows, cols, ec_level, cluster);
-        append_codeword_bits(&mut row_bits, cluster_id, right_indicator);
+        append_codeword_bits(&mut w, cluster_id, right_indicator)?;
 
         // Stop pattern
-        append_stop_pattern_bits(&mut row_bits);
-
-        matrix.push(row_bits);
+        append_stop_pattern_bits(&mut w)?;
     }
 
-    Ok(matrix)
+    Ok(Encoded::Matrix {
+        width,
+        height: rows,
+    })
 }
 
 /// Compute left row indicator for PDF417 row.
@@ -416,39 +427,39 @@ fn right_row_indicator(
 }
 
 /// Append a codeword's bar/space pattern as bits.
-fn append_codeword_bits(bits: &mut Vec<bool>, cluster: usize, codeword: u16) {
+fn append_codeword_bits(
+    w: &mut SliceWriter,
+    cluster: usize,
+    codeword: u16,
+) -> Result<(), EncodeError> {
     let pattern = codeword_pattern(cluster, codeword);
     let mut dark = true;
-    for &w in &pattern {
-        for _ in 0..w {
-            bits.push(dark);
-        }
+    for &width in &pattern {
+        w.push_run(dark, width as usize)?;
         dark = !dark;
     }
+    Ok(())
 }
 
-/// Append start pattern bits.
-fn append_pattern_bits(bits: &mut Vec<bool>, pattern: &[u8]) {
+/// Append a fixed pattern's bits.
+fn append_pattern_bits(w: &mut SliceWriter, pattern: &[u8]) -> Result<(), EncodeError> {
     let mut dark = true;
-    for &w in pattern {
-        for _ in 0..w {
-            bits.push(dark);
-        }
+    for &width in pattern {
+        w.push_run(dark, width as usize)?;
         dark = !dark;
     }
+    Ok(())
 }
 
 /// Append stop pattern bits (always ends with a dark bar).
-fn append_stop_pattern_bits(bits: &mut Vec<bool>) {
+fn append_stop_pattern_bits(w: &mut SliceWriter) -> Result<(), EncodeError> {
     let mut dark = true;
-    for &w in &STOP_PATTERN {
-        for _ in 0..w {
-            bits.push(dark);
-        }
+    for &width in &STOP_PATTERN {
+        w.push_run(dark, width as usize)?;
         dark = !dark;
     }
     // Final termination bar
-    bits.push(true);
+    w.push(true)
 }
 
 // ---- Tests -----------------------------------------------------------------
@@ -457,27 +468,41 @@ fn append_stop_pattern_bits(bits: &mut Vec<bool>) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_encode_basic() {
-        let out = Pdf417::encode("Hello, PDF417!").unwrap();
-        match out {
-            BarcodeOutput::Matrix(mb) => {
-                assert!(mb.height >= 3);
-                assert!(mb.width > 0);
-            }
-            _ => panic!("expected matrix barcode"),
+    fn encode(input: &str, buf: &mut [bool]) -> (usize, usize) {
+        match Pdf417::encode_into(input, buf).unwrap() {
+            Encoded::Matrix { width, height } => (width, height),
+            _ => panic!("expected matrix"),
         }
     }
 
     #[test]
+    fn test_encode_basic() {
+        let mut buf = [false; 1 << 16];
+        let (w, h) = encode("Hello, PDF417!", &mut buf);
+        assert!(h >= 3);
+        assert!(w > 0);
+    }
+
+    #[test]
     fn test_encode_numbers() {
-        let out = Pdf417::encode("1234567890").unwrap();
-        assert!(matches!(out, BarcodeOutput::Matrix(_)));
+        let mut buf = [false; 1 << 16];
+        let (w, _) = encode("1234567890", &mut buf);
+        assert!(w > 0);
     }
 
     #[test]
     fn test_empty_input() {
-        assert!(Pdf417::encode("").is_err());
+        let mut buf = [false; 1 << 16];
+        assert!(Pdf417::encode_into("", &mut buf).is_err());
+    }
+
+    #[test]
+    fn test_buffer_too_small() {
+        let mut buf = [false; 16];
+        assert_eq!(
+            Pdf417::encode_into("Hello", &mut buf),
+            Err(EncodeError::BufferTooSmall)
+        );
     }
 
     #[test]
@@ -487,15 +512,12 @@ mod tests {
 
     #[test]
     fn test_row_count() {
-        let out = Pdf417::encode("ABC").unwrap();
-        match out {
-            BarcodeOutput::Matrix(mb) => {
-                assert!(mb.height >= 3); // minimum 3 rows
-            }
-            _ => panic!("expected matrix"),
-        }
+        let mut buf = [false; 1 << 16];
+        let (_, h) = encode("ABC", &mut buf);
+        assert!(h >= 3); // minimum 3 rows
     }
 
+    #[cfg(feature = "alloc")]
     #[test]
     fn test_svg_output() {
         let svg = Pdf417::encode("Test").unwrap().to_svg_string();
@@ -504,9 +526,10 @@ mod tests {
 
     #[test]
     fn test_rs_encode_basic() {
-        let data = vec![1u16, 2, 3, 4];
-        let ec = rs_encode(&data, 2);
-        assert_eq!(ec.len(), 8); // 2^(2+1) = 8 check codewords
+        let data = [1u16, 2, 3, 4];
+        let mut ec = [0u16; MAX_EC];
+        let n = rs_encode(&data, 2, &mut ec);
+        assert_eq!(n, 8); // 2^(2+1) = 8 check codewords
     }
 
     #[test]

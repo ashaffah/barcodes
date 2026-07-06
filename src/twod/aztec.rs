@@ -16,14 +16,22 @@
 //! - Full-range Aztec: 1–32 layers
 #![forbid(unsafe_code)]
 
-extern crate alloc;
-use alloc::{vec, vec::Vec};
+use crate::common::{errors::EncodeError, traits::BarcodeEncoder, types::Encoded};
 
-use crate::common::{
-    errors::EncodeError,
-    traits::BarcodeEncoder,
-    types::{BarcodeOutput, MatrixBarcode},
-};
+// ---- Fixed capacity bounds (compact Aztec, up to 4 layers) -----------------
+
+/// Largest supported compact symbol dimension (`11 + 4 * 4`).
+const MAX_SIZE: usize = 27;
+/// Largest supported module count (`MAX_SIZE²`).
+const MAX_CELLS: usize = MAX_SIZE * MAX_SIZE;
+/// Ceiling on data codewords (compact Aztec tops out at 40 for 4 layers).
+const MAX_DATA_CW: usize = 64;
+/// Ceiling on error-correction codewords.
+const MAX_EC: usize = 32;
+/// Ceiling on combined data+EC bits.
+const MAX_BITS: usize = (MAX_DATA_CW + MAX_EC) * 6;
+/// Ceiling on intermediate upper-case/byte-mode bits from text encoding.
+const MAX_TEXT_BITS: usize = MAX_DATA_CW * 8 + 8;
 
 // ---- GF(2^n) Reed-Solomon --------------------------------------------------
 
@@ -42,31 +50,40 @@ fn gf64_mul(a: u8, b: u8) -> u8 {
     result & 0x3F
 }
 
-/// RS encode using GF(64) for data (6-bit codewords).
-fn rs_data(data: &[u8], ec_count: usize) -> Vec<u8> {
-    let mut remainder = vec![0u8; ec_count];
+/// RS encode using GF(64) for data (6-bit codewords) into `out[..ec_count]`.
+fn rs_data(data: &[u8], ec_count: usize, out: &mut [u8]) {
+    let mut rem_buf = [0u8; MAX_EC];
+    let remainder = &mut rem_buf[..ec_count];
     for &d in data {
         let d = d & 0x3F;
         let lead = d ^ remainder[0];
         remainder.copy_within(1.., 0);
-        *remainder.last_mut().unwrap() = 0;
+        remainder[ec_count - 1] = 0;
         if lead != 0 {
             for coef in remainder.iter_mut() {
                 *coef ^= gf64_mul(lead, *coef);
             }
         }
     }
-    remainder
+    out[..ec_count].copy_from_slice(remainder);
 }
 
 // ---- Text encoding ---------------------------------------------------------
 
-/// Encode ASCII text into 6-bit Aztec code data codewords.
+/// Encode ASCII text into 6-bit Aztec code data codewords in `out`.
 ///
-/// Uses the standard Aztec upper-case mode encoding.
-/// Characters not in the upper-case set fall back to byte encoding.
-fn encode_text(input: &str) -> Vec<u8> {
-    let mut bits: Vec<bool> = Vec::new();
+/// Uses the standard Aztec upper-case mode encoding; characters not in the
+/// upper-case set fall back to byte encoding.  Returns the codeword count.
+fn encode_text(input: &str, out: &mut [u8]) -> Result<usize, EncodeError> {
+    let mut bits = [false; MAX_TEXT_BITS];
+    let mut nbits = 0;
+    let mut push_bits = |value: u32, width: u32| -> Result<(), EncodeError> {
+        for bit in (0..width).rev() {
+            *bits.get_mut(nbits).ok_or(EncodeError::DataTooLong)? = (value >> bit) & 1 != 0;
+            nbits += 1;
+        }
+        Ok(())
+    };
 
     for &b in input.as_bytes() {
         // Upper-case mode: space=1, A-Z=2..27, .=28, ,=29, :=30, CR=31
@@ -82,79 +99,73 @@ fn encode_text(input: &str) -> Vec<u8> {
         };
 
         if let Some(c) = code {
-            // 5-bit upper-case character
-            for bit in (0..5).rev() {
-                bits.push((c >> bit) & 1 != 0);
-            }
+            push_bits(c as u32, 5)?; // 5-bit upper-case character
         } else {
-            // Shift to byte mode (code 31 in upper) then 8-bit byte
-            // Shift byte: 11111 in upper mode
-            for bit in (0..5).rev() {
-                bits.push((31u8 >> bit) & 1 != 0);
-            }
-            for bit in (0..8).rev() {
-                bits.push((b >> bit) & 1 != 0);
-            }
+            // Shift to byte mode (code 31 in upper) then 8-bit byte.
+            push_bits(31, 5)?;
+            push_bits(b as u32, 8)?;
         }
     }
 
-    // Pack bits into 6-bit codewords
-    // Pad to multiple of 6
-    while !bits.len().is_multiple_of(6) {
-        bits.push(true); // pad with 1
+    // Pad to a multiple of 6 bits (pad with 1).
+    while !nbits.is_multiple_of(6) {
+        *bits.get_mut(nbits).ok_or(EncodeError::DataTooLong)? = true;
+        nbits += 1;
     }
 
-    bits.chunks(6)
-        .map(|chunk| chunk.iter().fold(0u8, |acc, &b| (acc << 1) | b as u8))
-        .collect()
+    // Pack into 6-bit codewords.
+    let count = nbits / 6;
+    if count > out.len() {
+        return Err(EncodeError::DataTooLong);
+    }
+    for (i, cw) in out[..count].iter_mut().enumerate() {
+        let mut acc = 0u8;
+        for j in 0..6 {
+            acc = (acc << 1) | bits[i * 6 + j] as u8;
+        }
+        *cw = acc;
+    }
+    Ok(count)
 }
 
 // ---- Compact Aztec finder pattern ------------------------------------------
 
-/// Size of the compact Aztec finder (bull's-eye core): always 11×11 for compact.
-const COMPACT_FINDER_SIZE: usize = 11;
-
 /// Build the compact Aztec bull's-eye finder pattern centered in a grid.
-fn place_compact_finder(grid: &mut [Vec<i8>], center: usize) {
-    let _half = COMPACT_FINDER_SIZE / 2;
-    // Concentric squares: 5 rings (alternating dark/light from center out)
+fn place_compact_finder(grid: &mut [i8], size: usize, center: usize) {
+    // Concentric squares: 6 rings (alternating dark/light from center out).
     for ring in 0..=5i32 {
         let dark = ring % 2 == 0; // inner ring (0) is dark
         let val = if dark { 1i8 } else { 0i8 };
         let r_start = (center as i32 - ring).max(0) as usize;
-        let r_end = (center as i32 + ring).min(grid.len() as i32 - 1) as usize;
-        #[allow(clippy::needless_range_loop)]
+        let r_end = (center as i32 + ring).min(size as i32 - 1) as usize;
         for r in r_start..=r_end {
             for c in r_start..=r_end {
                 if r == r_start || r == r_end || c == r_start || c == r_end {
-                    grid[r][c] = val;
+                    grid[r * size + c] = val;
                 }
             }
         }
     }
     // Reference grid mark (bottom-right quadrant dark cell)
-    if center + 1 < grid.len() && center + 1 < grid[0].len() {
-        grid[center + 1][center + 1] = 1;
+    if center + 1 < size {
+        grid[(center + 1) * size + (center + 1)] = 1;
     }
 }
 
 /// Place the orientation marks for compact Aztec.
-fn place_compact_orientation(grid: &mut [Vec<i8>], center: usize) {
-    // The orientation pattern is 3 dark + 1 light going clockwise around the bull's-eye
-    // For compact: 3 dark modules on the top-left arc
+fn place_compact_orientation(grid: &mut [i8], size: usize, center: usize) {
+    // Three dark modules on the top-left arc, one light reference bottom-right.
     let c = center;
-    // Top-left
-    grid[c - 5][c - 5] = 1;
-    grid[c - 5][c - 4] = 1;
-    grid[c - 4][c - 5] = 1;
-    // Bottom-right (reference)
-    grid[c + 5][c + 5] = 0;
+    grid[(c - 5) * size + (c - 5)] = 1;
+    grid[(c - 5) * size + (c - 4)] = 1;
+    grid[(c - 4) * size + (c - 5)] = 1;
+    grid[(c + 5) * size + (c + 5)] = 0;
 }
 
 // ---- Compact Aztec encoder -------------------------------------------------
 
 /// Encode data bits into a single compact Aztec layer spiraling outward.
-fn place_compact_layer(grid: &mut [Vec<i8>], size: usize, layer: usize, data_bits: &[bool]) {
+fn place_compact_layer(grid: &mut [i8], size: usize, layer: usize, data_bits: &[bool]) {
     let center = size / 2;
     // Layer 1 starts at distance 6 from center (outside the 11×11 finder)
     let start = center as i32 - 5 - layer as i32;
@@ -169,34 +180,30 @@ fn place_compact_layer(grid: &mut [Vec<i8>], size: usize, layer: usize, data_bit
     let e = end as usize;
 
     // Top row (left to right)
-    #[allow(clippy::needless_range_loop)]
     for c in s..=e {
-        if bit_idx < data_bits.len() && grid[s][c] < 0 {
-            grid[s][c] = data_bits[bit_idx] as i8;
+        if bit_idx < data_bits.len() && grid[s * size + c] < 0 {
+            grid[s * size + c] = data_bits[bit_idx] as i8;
             bit_idx += 1;
         }
     }
     // Right column (top+1 to bottom)
-    #[allow(clippy::needless_range_loop)]
     for r in s + 1..=e {
-        if bit_idx < data_bits.len() && grid[r][e] < 0 {
-            grid[r][e] = data_bits[bit_idx] as i8;
+        if bit_idx < data_bits.len() && grid[r * size + e] < 0 {
+            grid[r * size + e] = data_bits[bit_idx] as i8;
             bit_idx += 1;
         }
     }
     // Bottom row (right-1 to left)
-    #[allow(clippy::needless_range_loop)]
     for c in (s..e).rev() {
-        if bit_idx < data_bits.len() && grid[e][c] < 0 {
-            grid[e][c] = data_bits[bit_idx] as i8;
+        if bit_idx < data_bits.len() && grid[e * size + c] < 0 {
+            grid[e * size + c] = data_bits[bit_idx] as i8;
             bit_idx += 1;
         }
     }
     // Left column (bottom-1 to top+1)
-    #[allow(clippy::needless_range_loop)]
     for r in (s + 1..e).rev() {
-        if bit_idx < data_bits.len() && grid[r][s] < 0 {
-            grid[r][s] = data_bits[bit_idx] as i8;
+        if bit_idx < data_bits.len() && grid[r * size + s] < 0 {
+            grid[r * size + s] = data_bits[bit_idx] as i8;
             bit_idx += 1;
         }
     }
@@ -214,32 +221,32 @@ fn place_compact_layer(grid: &mut [Vec<i8>], size: usize, layer: usize, data_bit
 ///
 /// ```rust
 /// use barcodes::common::traits::BarcodeEncoder;
+/// use barcodes::common::types::Encoded;
 /// use barcodes::twod::aztec::Aztec;
 ///
-/// let out = Aztec::encode("AZTEC").unwrap();
+/// let mut buf = [false; 27 * 27];
+/// let Encoded::Matrix { width, height } = Aztec::encode_into("AZTEC", &mut buf).unwrap()
+/// else { unreachable!() };
+/// assert_eq!(width, height);
 /// ```
 pub struct Aztec;
 
 impl BarcodeEncoder for Aztec {
     type Input = str;
-    type Error = EncodeError;
 
-    fn encode(input: &str) -> Result<BarcodeOutput, EncodeError> {
+    fn encode_into(input: &str, buf: &mut [bool]) -> Result<Encoded, EncodeError> {
         if input.is_empty() {
-            return Err(EncodeError::InvalidInput(
-                "Aztec input must not be empty".into(),
-            ));
+            return Err(EncodeError::InvalidInput("Aztec input must not be empty"));
         }
 
-        let data_codewords = encode_text(input);
-        if data_codewords.is_empty() {
-            return Err(EncodeError::InvalidInput("no encodable data found".into()));
+        let mut data_cw = [0u8; MAX_DATA_CW];
+        let data_len = encode_text(input, &mut data_cw)?;
+        if data_len == 0 {
+            return Err(EncodeError::InvalidInput("no encodable data found"));
         }
 
-        // Choose number of compact layers (1-4) based on data size
-        // Each compact layer provides ~(11 + 2*layer)*4 - 8 bit positions
-        // Simplified: use layer count based on codeword count
-        let layers = match data_codewords.len() {
+        // Choose number of compact layers (1-4) based on data size.
+        let layers = match data_len {
             0..=4 => 1,
             5..=11 => 2,
             12..=22 => 3,
@@ -248,61 +255,70 @@ impl BarcodeEncoder for Aztec {
         };
 
         let size = 11 + layers * 4; // compact Aztec size
+        let cells = size * size;
+        if buf.len() < cells {
+            return Err(EncodeError::BufferTooSmall);
+        }
 
-        let mut grid: Vec<Vec<i8>> = vec![vec![-1i8; size]; size];
+        let mut grid = [-1i8; MAX_CELLS];
         let center = size / 2;
 
         // Place finder pattern
-        place_compact_finder(&mut grid, center);
+        place_compact_finder(&mut grid, size, center);
 
         // Place orientation marks
         if center >= 5 {
-            place_compact_orientation(&mut grid, center);
+            place_compact_orientation(&mut grid, size, center);
         }
 
-        // Compute RS error correction for data (using ~23% EC)
-        let ec_count = (data_codewords.len() / 4).max(2);
-        let ec = rs_data(&data_codewords, ec_count);
+        // Compute RS error correction for data (using ~23% EC).
+        let ec_count = (data_len / 4).max(2);
+        let mut ec = [0u8; MAX_EC];
+        rs_data(&data_cw[..data_len], ec_count, &mut ec);
 
-        // Combine data + EC into bits
-        let mut all_cw: Vec<u8> = Vec::new();
-        all_cw.extend_from_slice(&data_codewords);
-        all_cw.extend_from_slice(&ec);
-
-        let data_bits: Vec<bool> = all_cw
-            .iter()
-            .flat_map(|&cw| (0..6).rev().map(move |i| (cw >> i) & 1 != 0))
-            .collect();
-
-        // Place data in layers
-        for layer in 1..=layers {
-            let layer_bits_start = (layer - 1) * (data_bits.len() / layers);
-            let layer_bits_end = if layer == layers {
-                data_bits.len()
+        // Expand combined data + EC codewords into bits (6 bits each).
+        let total_cw = data_len + ec_count;
+        let mut data_bits = [false; MAX_BITS];
+        let nbits = total_cw * 6;
+        for i in 0..total_cw {
+            let cw = if i < data_len {
+                data_cw[i]
             } else {
-                layer * (data_bits.len() / layers)
+                ec[i - data_len]
             };
-            if layer_bits_start < data_bits.len() {
+            for j in 0..6 {
+                data_bits[i * 6 + j] = (cw >> (5 - j)) & 1 != 0;
+            }
+        }
+        let data_bits = &data_bits[..nbits];
+
+        // Place data in layers.
+        for layer in 1..=layers {
+            let layer_bits_start = (layer - 1) * (nbits / layers);
+            let layer_bits_end = if layer == layers {
+                nbits
+            } else {
+                layer * (nbits / layers)
+            };
+            if layer_bits_start < nbits {
                 place_compact_layer(
                     &mut grid,
                     size,
                     layer,
-                    &data_bits[layer_bits_start..layer_bits_end.min(data_bits.len())],
+                    &data_bits[layer_bits_start..layer_bits_end.min(nbits)],
                 );
             }
         }
 
-        // Fill any remaining -1 cells with light
-        let modules: Vec<Vec<bool>> = grid
-            .into_iter()
-            .map(|row| row.into_iter().map(|v| v == 1).collect())
-            .collect();
+        // Fill the caller buffer (any -1 cell → light).
+        for i in 0..cells {
+            buf[i] = grid[i] == 1;
+        }
 
-        Ok(BarcodeOutput::Matrix(MatrixBarcode {
+        Ok(Encoded::Matrix {
             width: size,
             height: size,
-            modules,
-        }))
+        })
     }
 
     fn symbology_name() -> &'static str {
@@ -316,40 +332,49 @@ impl BarcodeEncoder for Aztec {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_encode_basic() {
-        let out = Aztec::encode("AZTEC").unwrap();
-        match out {
-            BarcodeOutput::Matrix(mb) => {
-                assert!(mb.width >= 15); // compact layer 1 = 11 + 4 = 15
-                assert_eq!(mb.width, mb.height);
-            }
-            _ => panic!("expected matrix barcode"),
-        }
-    }
-
-    #[test]
-    fn test_encode_short() {
-        let out = Aztec::encode("A").unwrap();
-        assert!(matches!(out, BarcodeOutput::Matrix(_)));
-    }
-
-    #[test]
-    fn test_finder_pattern_center_is_dark() {
-        let out = Aztec::encode("HI").unwrap();
-        match out {
-            BarcodeOutput::Matrix(mb) => {
-                let center = mb.width / 2;
-                // Center module should be dark
-                assert!(mb.modules[center][center], "center must be dark");
+    fn encode(input: &str, buf: &mut [bool]) -> usize {
+        match Aztec::encode_into(input, buf).unwrap() {
+            Encoded::Matrix { width, height } => {
+                assert_eq!(width, height);
+                width
             }
             _ => panic!("expected matrix"),
         }
     }
 
     #[test]
+    fn test_encode_basic() {
+        let mut buf = [false; MAX_CELLS];
+        assert!(encode("AZTEC", &mut buf) >= 15); // compact layer 1 = 15
+    }
+
+    #[test]
+    fn test_encode_short() {
+        let mut buf = [false; MAX_CELLS];
+        assert!(encode("A", &mut buf) >= 15);
+    }
+
+    #[test]
+    fn test_finder_pattern_center_is_dark() {
+        let mut buf = [false; MAX_CELLS];
+        let size = encode("HI", &mut buf);
+        let center = size / 2;
+        assert!(buf[center * size + center], "center must be dark");
+    }
+
+    #[test]
     fn test_empty_input() {
-        assert!(Aztec::encode("").is_err());
+        let mut buf = [false; MAX_CELLS];
+        assert!(Aztec::encode_into("", &mut buf).is_err());
+    }
+
+    #[test]
+    fn test_buffer_too_small() {
+        let mut buf = [false; 16];
+        assert_eq!(
+            Aztec::encode_into("A", &mut buf),
+            Err(EncodeError::BufferTooSmall)
+        );
     }
 
     #[test]
@@ -357,6 +382,7 @@ mod tests {
         assert_eq!(Aztec::symbology_name(), "Aztec Code");
     }
 
+    #[cfg(feature = "alloc")]
     #[test]
     fn test_svg_output() {
         let svg = Aztec::encode("Test").unwrap().to_svg_string();

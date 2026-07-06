@@ -7,13 +7,8 @@
 //! a simplified encoding of the DataBar structure.
 #![forbid(unsafe_code)]
 
-extern crate alloc;
-use alloc::{format, string::String, vec::Vec};
-
 use crate::common::{
-    errors::EncodeError,
-    traits::BarcodeEncoder,
-    types::{BarcodeOutput, LinearBarcode},
+    buffer::SliceWriter, errors::EncodeError, traits::BarcodeEncoder, types::Encoded,
 };
 
 // ---- DataBar character set tables ------------------------------------------
@@ -163,26 +158,23 @@ const DATABAR_TABLE: &[[u8; 4]] = &[
 ///
 /// ```rust
 /// use barcodes::common::traits::BarcodeEncoder;
+/// use barcodes::common::types::Encoded;
 /// use barcodes::gs1::databar::DataBar;
 ///
-/// let out = DataBar::encode("0614141123452").unwrap();
+/// let mut buf = [false; 256];
+/// let Encoded::Linear { len, .. } = DataBar::encode_into("0614141123452", &mut buf).unwrap()
+/// else { unreachable!() };
+/// let bars = &buf[..len];
 /// ```
 pub struct DataBar;
 
 impl BarcodeEncoder for DataBar {
     type Input = str;
-    type Error = EncodeError;
 
-    fn encode(input: &str) -> Result<BarcodeOutput, EncodeError> {
+    fn encode_into(input: &str, buf: &mut [bool]) -> Result<Encoded, EncodeError> {
         let digits = parse_and_validate(input)?;
-        let bars = encode_bars(&digits);
-        let text = format_text(&digits);
-
-        Ok(BarcodeOutput::Linear(LinearBarcode {
-            bars,
-            height: 33,
-            text: Some(text),
-        }))
+        let len = encode_bars(&digits, buf)?;
+        Ok(Encoded::Linear { len, height: 33 })
     }
 
     fn symbology_name() -> &'static str {
@@ -196,7 +188,7 @@ fn parse_and_validate(input: &str) -> Result<[u8; 14], EncodeError> {
     let trimmed = input.trim();
     if !trimmed.chars().all(|c| c.is_ascii_digit()) {
         return Err(EncodeError::InvalidInput(
-            "GS1 DataBar input must contain digits only".into(),
+            "GS1 DataBar input must contain digits only",
         ));
     }
 
@@ -219,15 +211,12 @@ fn parse_and_validate(input: &str) -> Result<[u8; 14], EncodeError> {
             }
             let expected = gtin_check_digit(&digits[..13]);
             if digits[13] != expected {
-                return Err(EncodeError::InvalidInput(format!(
-                    "GTIN check digit mismatch: got {}, expected {expected}",
-                    digits[13]
-                )));
+                return Err(EncodeError::InvalidInput("GTIN check digit mismatch"));
             }
             Ok(digits)
         }
         _ => Err(EncodeError::InvalidInput(
-            "GS1 DataBar input must be 13 or 14 digits".into(),
+            "GS1 DataBar input must be 13 or 14 digits",
         )),
     }
 }
@@ -260,7 +249,7 @@ pub(crate) fn gtin_check_digit(digits: &[u8]) -> u8 {
 /// - Separator (dark)
 /// - Right pair: left character + finder + right character
 /// - Right guard (1 module dark)
-fn encode_bars(digits: &[u8; 14]) -> Vec<bool> {
+fn encode_bars(digits: &[u8; 14], buf: &mut [bool]) -> Result<usize, EncodeError> {
     // Compute the numerical value of the GTIN
     let mut value: u64 = 0;
     for &d in digits.iter() {
@@ -272,25 +261,25 @@ fn encode_bars(digits: &[u8; 14]) -> Vec<bool> {
     let left_value = value / 4_537_077;
     let right_value = value % 4_537_077;
 
-    let mut bars: Vec<bool> = Vec::new();
+    let mut w = SliceWriter::new(buf);
 
     // Encode left half
-    encode_half(&mut bars, left_value, true);
+    encode_half(&mut w, left_value, true)?;
 
     // Separator (1 narrow space)
-    bars.push(false);
+    w.push(false)?;
 
     // Encode right half
-    encode_half(&mut bars, right_value, false);
+    encode_half(&mut w, right_value, false)?;
 
-    bars
+    Ok(w.len())
 }
 
 /// Encode one half of a DataBar Omnidirectional symbol.
-fn encode_half(bars: &mut Vec<bool>, value: u64, is_left: bool) {
+fn encode_half(w: &mut SliceWriter, value: u64, is_left: bool) -> Result<(), EncodeError> {
     // Left guard: 1 dark bar
     if is_left {
-        bars.push(true);
+        w.push(true)?;
     }
 
     // Compute character values from GTIN half value
@@ -300,39 +289,38 @@ fn encode_half(bars: &mut Vec<bool>, value: u64, is_left: bool) {
     let char_b = if char_b >= 116 { 115 } else { char_b };
 
     // Encode character A
-    encode_databar_char(bars, char_a, true);
+    encode_databar_char(w, char_a, true)?;
 
     // Finder pattern
     let mut dark = false;
-    for &w in &FINDER_PATTERN {
-        for _ in 0..w {
-            bars.push(dark);
-        }
+    for &width in &FINDER_PATTERN {
+        w.push_run(dark, width as usize)?;
         dark = !dark;
     }
 
     // Encode character B
-    encode_databar_char(bars, char_b, false);
+    encode_databar_char(w, char_b, false)?;
 
     // Right guard: 1 dark bar
     if !is_left {
-        bars.push(true);
+        w.push(true)?;
     }
+
+    Ok(())
 }
 
-fn encode_databar_char(bars: &mut Vec<bool>, idx: usize, start_dark: bool) {
+fn encode_databar_char(
+    w: &mut SliceWriter,
+    idx: usize,
+    start_dark: bool,
+) -> Result<(), EncodeError> {
     let pattern = &DATABAR_TABLE[idx.min(DATABAR_TABLE.len() - 1)];
     let mut dark = start_dark;
-    for &w in pattern.iter() {
-        for _ in 0..w {
-            bars.push(dark);
-        }
+    for &width in pattern.iter() {
+        w.push_run(dark, width as usize)?;
         dark = !dark;
     }
-}
-
-fn format_text(digits: &[u8; 14]) -> String {
-    digits.iter().map(|d| (b'0' + d) as char).collect()
+    Ok(())
 }
 
 // ---- Tests -----------------------------------------------------------------
@@ -348,31 +336,40 @@ mod tests {
         assert_eq!(gtin_check_digit(&digits), 2);
     }
 
+    fn encode_len(input: &str) -> usize {
+        let mut buf = [false; 256];
+        match DataBar::encode_into(input, &mut buf).unwrap() {
+            Encoded::Linear { len, .. } => len,
+            _ => panic!("expected linear"),
+        }
+    }
+
     #[test]
     fn test_encode_14_digits() {
-        let out = DataBar::encode("00614141123452").unwrap();
-        assert!(matches!(out, BarcodeOutput::Linear(_)));
+        assert!(encode_len("00614141123452") > 0);
     }
 
     #[test]
     fn test_encode_13_digits_auto_check() {
-        let out = DataBar::encode("0061414112345").unwrap();
-        assert!(matches!(out, BarcodeOutput::Linear(_)));
+        assert!(encode_len("0061414112345") > 0);
     }
 
     #[test]
     fn test_invalid_check_digit() {
-        assert!(DataBar::encode("00614141123453").is_err());
+        let mut buf = [false; 256];
+        assert!(DataBar::encode_into("00614141123453", &mut buf).is_err());
     }
 
     #[test]
     fn test_invalid_chars() {
-        assert!(DataBar::encode("0061414112345X").is_err());
+        let mut buf = [false; 256];
+        assert!(DataBar::encode_into("0061414112345X", &mut buf).is_err());
     }
 
     #[test]
     fn test_wrong_length() {
-        assert!(DataBar::encode("0061414").is_err());
+        let mut buf = [false; 256];
+        assert!(DataBar::encode_into("0061414", &mut buf).is_err());
     }
 
     #[test]
@@ -380,6 +377,7 @@ mod tests {
         assert_eq!(DataBar::symbology_name(), "GS1 DataBar");
     }
 
+    #[cfg(feature = "alloc")]
     #[test]
     fn test_svg_output() {
         let svg = DataBar::encode("00614141123452").unwrap().to_svg_string();

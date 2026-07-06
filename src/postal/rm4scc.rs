@@ -17,14 +17,14 @@
 //! encoded characters modulo 6.
 #![forbid(unsafe_code)]
 
-extern crate alloc;
-use alloc::{format, string::String, vec::Vec};
-
 use crate::common::{
-    errors::EncodeError,
-    traits::BarcodeEncoder,
-    types::{BarcodeOutput, LinearBarcode},
+    buffer::SliceWriter, errors::EncodeError, traits::BarcodeEncoder, types::Encoded,
 };
+
+/// Maximum number of input characters supported in a single symbol.
+const MAX_CHARS: usize = 32;
+/// Maximum number of bar states (start + data×4 + check + stop).
+const MAX_STATES: usize = MAX_CHARS * 4 + 3;
 
 // ---- Character encoding table ----------------------------------------------
 
@@ -90,22 +90,18 @@ fn state_to_bars(state: u8) -> (bool, bool) {
     }
 }
 
-/// Encode bar states into linear modules.
-/// Each bar is represented as a single dark module with light spaces between.
-fn states_to_modules(states: &[u8]) -> Vec<bool> {
-    let mut modules: Vec<bool> = Vec::new();
+/// Encode bar states into linear modules written into `buf`.
+/// Each bar is a single module (Tracker → light) with light spaces between.
+fn states_to_modules(states: &[u8], buf: &mut [bool]) -> Result<usize, EncodeError> {
+    let mut w = SliceWriter::new(buf);
     for (i, &state) in states.iter().enumerate() {
-        // For a 4-state bar, we indicate presence with dark module
-        // Full bar = darkest → encoded as dark
-        // Ascender/Descender = partial → encoded as dark
-        // Tracker = short → encoded as dark (but shorter in physical rendering)
-        let dark = state != 0; // all states produce some bar (even tracker)
-        modules.push(dark);
+        let dark = state != 0;
+        w.push(dark)?;
         if i + 1 < states.len() {
-            modules.push(false); // space between bars
+            w.push(false)?; // space between bars
         }
     }
-    modules
+    Ok(w.len())
 }
 
 // ---- Check digit -----------------------------------------------------------
@@ -124,7 +120,7 @@ fn compute_check(chars: &[char]) -> Result<u8, EncodeError> {
         let entry = RM4SCC_TABLE
             .iter()
             .find(|(c, _)| *c == ch)
-            .ok_or_else(|| EncodeError::InvalidInput(format!("invalid character '{ch}'")))?;
+            .ok_or(EncodeError::InvalidCharacter(ch))?;
 
         // Row value: based on bars 0 and 1 (upper pair)
         let (a0, _d0) = state_to_bars(entry.1[0]);
@@ -157,76 +153,74 @@ fn compute_check(chars: &[char]) -> Result<u8, EncodeError> {
 ///
 /// ```rust
 /// use barcodes::common::traits::BarcodeEncoder;
+/// use barcodes::common::types::Encoded;
 /// use barcodes::postal::rm4scc::Rm4scc;
 ///
-/// let out = Rm4scc::encode("SN3 1SD").unwrap();
+/// let mut buf = [false; 128];
+/// let Encoded::Linear { len, .. } = Rm4scc::encode_into("SN3 1SD", &mut buf).unwrap()
+/// else { unreachable!() };
+/// let bars = &buf[..len];
 /// ```
 pub struct Rm4scc;
 
 impl BarcodeEncoder for Rm4scc {
     type Input = str;
-    type Error = EncodeError;
 
-    fn encode(input: &str) -> Result<BarcodeOutput, EncodeError> {
-        // Normalize: uppercase and remove spaces
-        let normalized: String = input
+    fn encode_into(input: &str, buf: &mut [bool]) -> Result<Encoded, EncodeError> {
+        // Normalize into a fixed stack buffer: uppercase, whitespace removed.
+        let mut chars = [' '; MAX_CHARS];
+        let mut n = 0;
+        for c in input
             .chars()
             .filter(|c| !c.is_whitespace())
             .map(|c| c.to_ascii_uppercase())
-            .collect();
+        {
+            if n >= MAX_CHARS {
+                return Err(EncodeError::DataTooLong);
+            }
+            chars[n] = c;
+            n += 1;
+        }
 
-        if normalized.is_empty() {
-            return Err(EncodeError::InvalidInput(
-                "RM4SCC input must not be empty".into(),
-            ));
+        if n == 0 {
+            return Err(EncodeError::InvalidInput("RM4SCC input must not be empty"));
         }
 
         // Validate all characters
-        for ch in normalized.chars() {
-            if !ch.is_ascii_alphanumeric() {
-                return Err(EncodeError::InvalidInput(format!(
-                    "character '{ch}' is not valid in RM4SCC"
-                )));
-            }
-            if RM4SCC_TABLE.iter().find(|(c, _)| *c == ch).is_none() {
-                return Err(EncodeError::InvalidInput(format!(
-                    "character '{ch}' is not in RM4SCC table"
-                )));
+        for &ch in &chars[..n] {
+            if RM4SCC_TABLE.iter().all(|(c, _)| *c != ch) {
+                return Err(EncodeError::InvalidCharacter(ch));
             }
         }
 
-        let chars: Vec<char> = normalized.chars().collect();
-        let check_val = compute_check(&chars)?;
+        let check_val = compute_check(&chars[..n])?;
 
-        let mut states: Vec<u8> = Vec::new();
-
-        // Start bar
-        states.push(START_BAR);
-
-        // Data bars
-        for &ch in &chars {
+        // Assemble bar states in a fixed stack buffer.
+        let mut states = [0u8; MAX_STATES];
+        let mut s = 0;
+        states[s] = START_BAR;
+        s += 1;
+        for &ch in &chars[..n] {
             let entry = RM4SCC_TABLE
                 .iter()
                 .find(|(c, _)| *c == ch)
                 .expect("already validated");
-            states.extend_from_slice(&entry.1);
+            states[s..s + 4].copy_from_slice(&entry.1);
+            s += 4;
         }
+        // Check digit bar: combined index (0–35) reduced to a 4-state bar value
+        // (mod 4, minimum 1 to ensure at least an ascender bar).
+        states[s] = (check_val % 4).max(1);
+        s += 1;
+        states[s] = STOP_BAR;
+        s += 1;
 
-        // Check digit bar: the combined index (0-35) reduced to a 4-state bar
-        // value (mod 4, minimum 1 to ensure at least an ascender bar)
-        let check_state = check_val % 4;
-        states.push(check_state.max(1)); // at least ascender
+        let modules = states_to_modules(&states[..s], buf)?;
 
-        // Stop bar
-        states.push(STOP_BAR);
-
-        let modules = states_to_modules(&states);
-
-        Ok(BarcodeOutput::Linear(LinearBarcode {
-            bars: modules,
+        Ok(Encoded::Linear {
+            len: modules,
             height: 20,
-            text: Some(input.trim().into()),
-        }))
+        })
     }
 
     fn symbology_name() -> &'static str {
@@ -240,40 +234,44 @@ impl BarcodeEncoder for Rm4scc {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_encode_postcode() {
-        let out = Rm4scc::encode("SN3 1SD").unwrap();
-        assert!(matches!(out, BarcodeOutput::Linear(_)));
-    }
-
-    #[test]
-    fn test_encode_alphanumeric() {
-        let out = Rm4scc::encode("EC1A1BB").unwrap();
-        assert!(matches!(out, BarcodeOutput::Linear(_)));
-    }
-
-    #[test]
-    fn test_normalize_spaces() {
-        let out1 = Rm4scc::encode("SN31SD").unwrap();
-        let out2 = Rm4scc::encode("SN3 1SD").unwrap();
-        // Bars should be identical regardless of spaces; only text label differs
-        match (out1, out2) {
-            (BarcodeOutput::Linear(a), BarcodeOutput::Linear(b)) => {
-                assert_eq!(a.bars, b.bars);
-            }
+    fn bars<'a>(input: &str, buf: &'a mut [bool]) -> &'a [bool] {
+        match Rm4scc::encode_into(input, buf).unwrap() {
+            Encoded::Linear { len, .. } => &buf[..len],
             _ => panic!("expected linear"),
         }
     }
 
     #[test]
+    fn test_encode_postcode() {
+        let mut buf = [false; 128];
+        assert!(!bars("SN3 1SD", &mut buf).is_empty());
+    }
+
+    #[test]
+    fn test_encode_alphanumeric() {
+        let mut buf = [false; 128];
+        assert!(!bars("EC1A1BB", &mut buf).is_empty());
+    }
+
+    #[test]
+    fn test_normalize_spaces() {
+        // Bars are identical regardless of spaces.
+        let mut buf1 = [false; 128];
+        let mut buf2 = [false; 128];
+        assert_eq!(bars("SN31SD", &mut buf1), bars("SN3 1SD", &mut buf2));
+    }
+
+    #[test]
     fn test_invalid_char() {
-        assert!(Rm4scc::encode("SN3-1SD").is_err());
+        let mut buf = [false; 128];
+        assert!(Rm4scc::encode_into("SN3-1SD", &mut buf).is_err());
     }
 
     #[test]
     fn test_empty_input() {
-        assert!(Rm4scc::encode("").is_err());
-        assert!(Rm4scc::encode("   ").is_err());
+        let mut buf = [false; 128];
+        assert!(Rm4scc::encode_into("", &mut buf).is_err());
+        assert!(Rm4scc::encode_into("   ", &mut buf).is_err());
     }
 
     #[test]
@@ -281,6 +279,7 @@ mod tests {
         assert_eq!(Rm4scc::symbology_name(), "RM4SCC");
     }
 
+    #[cfg(feature = "alloc")]
     #[test]
     fn test_svg_output() {
         let svg = Rm4scc::encode("EC1A1BB").unwrap().to_svg_string();
@@ -291,12 +290,7 @@ mod tests {
     fn test_bar_count() {
         // SN31SD = 6 chars × 4 bars + start(1) + check(1) + stop(1) = 27 bars
         // module count = 27 bars + 26 spaces = 53
-        let out = Rm4scc::encode("SN31SD").unwrap();
-        match out {
-            BarcodeOutput::Linear(lb) => {
-                assert_eq!(lb.bars.len(), 53);
-            }
-            _ => panic!("expected linear"),
-        }
+        let mut buf = [false; 128];
+        assert_eq!(bars("SN31SD", &mut buf).len(), 53);
     }
 }

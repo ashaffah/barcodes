@@ -15,15 +15,13 @@
 //! ```
 #![forbid(unsafe_code)]
 
-extern crate alloc;
-use alloc::{string::String, vec::Vec};
-
-use crate::common::{
-    errors::EncodeError,
-    traits::BarcodeEncoder,
-    types::{BarcodeOutput, LinearBarcode},
+use crate::common::{errors::EncodeError, traits::BarcodeEncoder, types::Encoded};
+use crate::linear::code128::{
+    FNC1, MAX_SYMBOLS, START_B, START_C, STOP, compute_check, symbols_to_bars,
 };
-use crate::linear::code128::{FNC1, START_B, START_C, STOP, compute_check, symbols_to_bars};
+
+/// Maximum number of AI segments supported in a single symbol.
+const MAX_SEGMENTS: usize = 32;
 
 // ---- AI definitions --------------------------------------------------------
 
@@ -67,32 +65,29 @@ fn is_fixed_length_ai(ai: &str) -> bool {
 ///
 /// ```rust
 /// use barcodes::common::traits::BarcodeEncoder;
+/// use barcodes::common::types::Encoded;
 /// use barcodes::gs1::gs1_128::Gs1_128;
 ///
-/// let out = Gs1_128::encode("(01)12345678901231").unwrap();
+/// let mut buf = [false; 1024];
+/// let Encoded::Linear { len, .. } = Gs1_128::encode_into("(01)12345678901231", &mut buf).unwrap()
+/// else { unreachable!() };
+/// let bars = &buf[..len];
 /// ```
 pub struct Gs1_128;
 
 impl BarcodeEncoder for Gs1_128 {
     type Input = str;
-    type Error = EncodeError;
 
-    fn encode(input: &str) -> Result<BarcodeOutput, EncodeError> {
+    fn encode_into(input: &str, buf: &mut [bool]) -> Result<Encoded, EncodeError> {
         if input.trim().is_empty() {
-            return Err(EncodeError::InvalidInput(
-                "GS1-128 input must not be empty".into(),
-            ));
+            return Err(EncodeError::InvalidInput("GS1-128 input must not be empty"));
         }
 
-        let segments = parse_gs1(input.trim())?;
-        let bars = build_barcode(&segments);
-        let text = build_text_representation(&segments);
+        let mut segments = [AiSegment { ai: "", data: "" }; MAX_SEGMENTS];
+        let count = parse_gs1(input.trim(), &mut segments)?;
+        let len = build_barcode(&segments[..count], buf)?;
 
-        Ok(BarcodeOutput::Linear(LinearBarcode {
-            bars,
-            height: 50,
-            text: Some(text),
-        }))
+        Ok(Encoded::Linear { len, height: 50 })
     }
 
     fn symbology_name() -> &'static str {
@@ -102,25 +97,27 @@ impl BarcodeEncoder for Gs1_128 {
 
 // ---- Types -----------------------------------------------------------------
 
-struct AiSegment {
-    ai: String,
-    data: String,
+/// An (AI, data) pair borrowing slices of the input string — no allocation.
+#[derive(Clone, Copy)]
+struct AiSegment<'a> {
+    ai: &'a str,
+    data: &'a str,
 }
 
 // ---- Helpers ---------------------------------------------------------------
 
-/// Parse parenthesized AI format into (AI, data) pairs.
-fn parse_gs1(input: &str) -> Result<Vec<AiSegment>, EncodeError> {
-    let mut segments: Vec<AiSegment> = Vec::new();
+/// Parse parenthesized AI format into `out`, returning the number of segments.
+fn parse_gs1<'a>(
+    input: &'a str,
+    out: &mut [AiSegment<'a>; MAX_SEGMENTS],
+) -> Result<usize, EncodeError> {
     let bytes = input.as_bytes();
     let mut pos = 0;
+    let mut count = 0;
 
     while pos < bytes.len() {
         if bytes[pos] != b'(' {
-            return Err(EncodeError::InvalidInput(alloc::format!(
-                "expected '(' at position {pos}, got '{}'",
-                bytes[pos] as char
-            )));
+            return Err(EncodeError::InvalidInput("expected '(' at start of AI"));
         }
         pos += 1; // skip '('
 
@@ -128,20 +125,16 @@ fn parse_gs1(input: &str) -> Result<Vec<AiSegment>, EncodeError> {
         let ai_start = pos;
         while pos < bytes.len() && bytes[pos] != b')' {
             if !bytes[pos].is_ascii_digit() {
-                return Err(EncodeError::InvalidInput(
-                    "AI must contain only digits".into(),
-                ));
+                return Err(EncodeError::InvalidInput("AI must contain only digits"));
             }
             pos += 1;
         }
         if pos >= bytes.len() {
             return Err(EncodeError::InvalidInput(
-                "unclosed '(' in AI specification".into(),
+                "unclosed '(' in AI specification",
             ));
         }
-        let ai = core::str::from_utf8(&bytes[ai_start..pos])
-            .map_err(|_| EncodeError::InvalidInput("invalid UTF-8 in AI".into()))?;
-        let ai = String::from(ai);
+        let ai = &input[ai_start..pos];
         pos += 1; // skip ')'
 
         // Read data until next '(' or end of string
@@ -149,33 +142,39 @@ fn parse_gs1(input: &str) -> Result<Vec<AiSegment>, EncodeError> {
         while pos < bytes.len() && bytes[pos] != b'(' {
             pos += 1;
         }
-        let data = core::str::from_utf8(&bytes[data_start..pos])
-            .map_err(|_| EncodeError::InvalidInput("invalid UTF-8 in AI data".into()))?;
+        let data = &input[data_start..pos];
 
         if data.is_empty() {
-            return Err(EncodeError::InvalidInput(alloc::format!(
-                "AI ({ai}) has no data"
-            )));
+            return Err(EncodeError::InvalidInput("AI has no data"));
         }
 
-        segments.push(AiSegment {
-            ai,
-            data: String::from(data),
-        });
+        if count >= MAX_SEGMENTS {
+            return Err(EncodeError::DataTooLong);
+        }
+        out[count] = AiSegment { ai, data };
+        count += 1;
     }
 
-    if segments.is_empty() {
-        return Err(EncodeError::InvalidInput(
-            "no valid AIs found in input".into(),
-        ));
+    if count == 0 {
+        return Err(EncodeError::InvalidInput("no valid AIs found in input"));
     }
 
-    Ok(segments)
+    Ok(count)
 }
 
-/// Build the Code 128 symbol sequence for a GS1-128 barcode.
-fn build_barcode(segments: &[AiSegment]) -> Vec<bool> {
-    let mut symbols: Vec<u8> = Vec::new();
+/// Build the Code 128 symbol sequence for a GS1-128 barcode, writing bars into `buf`.
+fn build_barcode(segments: &[AiSegment], buf: &mut [bool]) -> Result<usize, EncodeError> {
+    let mut symbols = [0u8; MAX_SYMBOLS];
+    let mut n = 0;
+    macro_rules! push {
+        ($v:expr) => {{
+            if n >= MAX_SYMBOLS {
+                return Err(EncodeError::DataTooLong);
+            }
+            symbols[n] = $v;
+            n += 1;
+        }};
+    }
 
     // Determine if we can start with Code C (all-digit data)
     let all_numeric = segments
@@ -183,15 +182,15 @@ fn build_barcode(segments: &[AiSegment]) -> Vec<bool> {
         .all(|s| s.data.chars().all(|c| c.is_ascii_digit()));
 
     let start = if all_numeric { START_C } else { START_B };
-    symbols.push(start);
+    push!(start);
 
     // FNC1 immediately after start — signals GS1 application
-    symbols.push(FNC1);
+    push!(FNC1);
 
     for (i, seg) in segments.iter().enumerate() {
         // Encode AI itself using Code B (always printable ASCII digits)
         for byte in seg.ai.bytes() {
-            symbols.push(byte - 0x20); // Code B value
+            push!(byte - 0x20); // Code B value
         }
 
         // Encode data
@@ -206,12 +205,12 @@ fn build_barcode(segments: &[AiSegment]) -> Vec<bool> {
             while j + 1 < data_bytes.len() {
                 let tens = data_bytes[j] - b'0';
                 let units = data_bytes[j + 1] - b'0';
-                symbols.push(tens * 10 + units);
+                push!(tens * 10 + units);
                 j += 2;
             }
             if j < data_bytes.len() {
                 // Odd byte left, use Code B
-                symbols.push(data_bytes[j] - 0x20);
+                push!(data_bytes[j] - 0x20);
             }
         } else {
             // Use Code B
@@ -220,35 +219,22 @@ fn build_barcode(segments: &[AiSegment]) -> Vec<bool> {
                     // Skip invalid bytes; real implementation would return error
                     continue;
                 }
-                symbols.push(byte - 0x20);
+                push!(byte - 0x20);
             }
         }
 
         // Insert FNC1 separator after variable-length AI (not after the last one)
-        if i + 1 < segments.len() && !is_fixed_length_ai(&seg.ai) {
-            symbols.push(FNC1);
+        if i + 1 < segments.len() && !is_fixed_length_ai(seg.ai) {
+            push!(FNC1);
         }
     }
 
-    // Check symbol
-    let check = compute_check(&symbols);
-    symbols.push(check);
+    // Check symbol, then stop.
+    let check = compute_check(&symbols[..n]);
+    push!(check);
+    push!(STOP);
 
-    // Stop
-    symbols.push(STOP);
-
-    symbols_to_bars(&symbols)
-}
-
-fn build_text_representation(segments: &[AiSegment]) -> String {
-    let mut s = String::new();
-    for seg in segments {
-        s.push('(');
-        s.push_str(&seg.ai);
-        s.push(')');
-        s.push_str(&seg.data);
-    }
-    s
+    symbols_to_bars(&symbols[..n], buf)
 }
 
 // ---- Tests -----------------------------------------------------------------
@@ -257,30 +243,42 @@ fn build_text_representation(segments: &[AiSegment]) -> String {
 mod tests {
     use super::*;
 
+    fn encode_len(input: &str) -> usize {
+        let mut buf = [false; 2048];
+        match Gs1_128::encode_into(input, &mut buf).unwrap() {
+            Encoded::Linear { len, .. } => len,
+            _ => panic!("expected linear"),
+        }
+    }
+
+    fn parse(input: &str) -> ([AiSegment<'_>; MAX_SEGMENTS], usize) {
+        let mut segs = [AiSegment { ai: "", data: "" }; MAX_SEGMENTS];
+        let n = parse_gs1(input, &mut segs).unwrap();
+        (segs, n)
+    }
+
     #[test]
     fn test_encode_single_ai() {
-        let out = Gs1_128::encode("(01)12345678901231").unwrap();
-        assert!(matches!(out, BarcodeOutput::Linear(_)));
+        assert!(encode_len("(01)12345678901231") > 0);
     }
 
     #[test]
     fn test_encode_multiple_ai() {
-        let out = Gs1_128::encode("(01)12345678901231(10)ABC123").unwrap();
-        assert!(matches!(out, BarcodeOutput::Linear(_)));
+        assert!(encode_len("(01)12345678901231(10)ABC123") > 0);
     }
 
     #[test]
     fn test_parse_ai_digits_only() {
-        let segs = parse_gs1("(01)12345678901231").unwrap();
-        assert_eq!(segs.len(), 1);
+        let (segs, n) = parse("(01)12345678901231");
+        assert_eq!(n, 1);
         assert_eq!(segs[0].ai, "01");
         assert_eq!(segs[0].data, "12345678901231");
     }
 
     #[test]
     fn test_parse_multiple_ais() {
-        let segs = parse_gs1("(01)12345678901231(10)LOT123").unwrap();
-        assert_eq!(segs.len(), 2);
+        let (segs, n) = parse("(01)12345678901231(10)LOT123");
+        assert_eq!(n, 2);
         assert_eq!(segs[0].ai, "01");
         assert_eq!(segs[1].ai, "10");
         assert_eq!(segs[1].data, "LOT123");
@@ -288,12 +286,14 @@ mod tests {
 
     #[test]
     fn test_invalid_no_parens() {
-        assert!(Gs1_128::encode("0112345678901231").is_err());
+        let mut buf = [false; 2048];
+        assert!(Gs1_128::encode_into("0112345678901231", &mut buf).is_err());
     }
 
     #[test]
     fn test_empty_input() {
-        assert!(Gs1_128::encode("").is_err());
+        let mut buf = [false; 2048];
+        assert!(Gs1_128::encode_into("", &mut buf).is_err());
     }
 
     #[test]
@@ -301,6 +301,7 @@ mod tests {
         assert_eq!(Gs1_128::symbology_name(), "GS1-128");
     }
 
+    #[cfg(feature = "alloc")]
     #[test]
     fn test_svg_output() {
         let svg = Gs1_128::encode("(01)12345678901231")

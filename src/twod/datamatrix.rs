@@ -12,14 +12,18 @@
 //! - Reed-Solomon error correction codewords
 #![forbid(unsafe_code)]
 
-extern crate alloc;
-use alloc::{vec, vec::Vec};
+use crate::common::{errors::EncodeError, traits::BarcodeEncoder, types::Encoded};
 
-use crate::common::{
-    errors::EncodeError,
-    traits::BarcodeEncoder,
-    types::{BarcodeOutput, MatrixBarcode},
-};
+// ---- Fixed capacity bounds (largest supported 26×26 symbol) ----------------
+
+/// Largest supported symbol dimension.
+const MAX_SIZE: usize = 26;
+/// Largest supported module count (`MAX_SIZE²`).
+const MAX_CELLS: usize = MAX_SIZE * MAX_SIZE;
+/// Largest data-codeword capacity across supported symbols.
+const MAX_DATA_CW: usize = 44;
+/// Largest error-correction codeword count across supported symbols.
+const MAX_EC: usize = 28;
 
 // ---- Symbol parameters -----------------------------------------------------
 
@@ -67,118 +71,135 @@ fn gf256_pow(base: u8, exp: usize) -> u8 {
     result
 }
 
-/// Compute Reed-Solomon check bytes for Data Matrix.
-fn rs_encode_dm(data: &[u8], ec_count: usize) -> Vec<u8> {
-    // Generator polynomial coefficients
-    let mut poly = vec![1u8; 1];
+/// Compute Reed-Solomon check bytes for Data Matrix into `out[..ec_count]`.
+fn rs_encode_dm(data: &[u8], ec_count: usize, out: &mut [u8]) {
+    // Generator polynomial coefficients (length ec_count + 1).
+    let mut poly = [0u8; MAX_EC + 1];
+    poly[0] = 1;
     for i in 0..ec_count {
         let root = gf256_pow(2, i + 1);
-        let new_len = poly.len() + 1;
-        let mut new_poly = vec![0u8; new_len];
-        for (j, &gj) in poly.iter().enumerate() {
-            new_poly[j] ^= gj;
-            new_poly[j + 1] ^= gf256_mul(gj, root);
+        let cur = i + 1; // current polynomial length before this multiply
+        let mut new_poly = [0u8; MAX_EC + 1];
+        for j in 0..cur {
+            new_poly[j] ^= poly[j];
+            new_poly[j + 1] ^= gf256_mul(poly[j], root);
         }
-        poly = new_poly;
+        poly[..cur + 1].copy_from_slice(&new_poly[..cur + 1]);
     }
 
-    // Polynomial division
-    let mut remainder = vec![0u8; ec_count];
+    // Polynomial division.
+    let mut rem_buf = [0u8; MAX_EC];
+    let rem = &mut rem_buf[..ec_count];
     for &d in data {
-        let lead = d ^ remainder[0];
-        remainder.copy_within(1.., 0);
-        *remainder.last_mut().unwrap() = 0;
+        let lead = d ^ rem[0];
+        rem.copy_within(1.., 0);
+        rem[ec_count - 1] = 0;
         if lead != 0 {
             for i in 0..ec_count {
-                remainder[i] ^= gf256_mul(lead, poly[i + 1]);
+                rem[i] ^= gf256_mul(lead, poly[i + 1]);
             }
         }
     }
-    remainder
+    out[..ec_count].copy_from_slice(rem);
 }
 
 // ---- ASCII encoding --------------------------------------------------------
 
-/// Encode input bytes in Data Matrix ASCII mode.
+/// Encode input bytes in Data Matrix ASCII mode into `out`, returning the count.
+///
 /// ASCII values 1-128 are encoded as value + 1 (so 0 is unused).
 /// Digit pairs 00-99 are encoded as 130+value.
-fn ascii_encode(input: &[u8]) -> Vec<u8> {
-    let mut codewords: Vec<u8> = Vec::new();
+fn ascii_encode(input: &[u8], out: &mut [u8]) -> Result<usize, EncodeError> {
+    let mut n = 0;
+    let mut push = |v: u8| -> Result<(), EncodeError> {
+        *out.get_mut(n).ok_or(EncodeError::DataTooLong)? = v;
+        n += 1;
+        Ok(())
+    };
     let mut i = 0;
     while i < input.len() {
         if i + 1 < input.len() && input[i].is_ascii_digit() && input[i + 1].is_ascii_digit() {
             // Encode digit pair
             let val = (input[i] - b'0') * 10 + (input[i + 1] - b'0');
-            codewords.push(130 + val);
+            push(130 + val)?;
             i += 2;
         } else {
             // Single ASCII
-            codewords.push(input[i] + 1);
+            push(input[i] + 1)?;
             i += 1;
         }
     }
-    codewords
+    Ok(n)
 }
 
 // ---- Main encoder ----------------------------------------------------------
 
-/// Build a Data Matrix grid with finder pattern and data.
-fn build_grid(size: usize, data_codewords: &[u8], ec_codewords: &[u8]) -> Vec<Vec<bool>> {
-    // Initialize grid: -1 = unplaced, 0 = light, 1 = dark
-    let mut grid: Vec<Vec<i16>> = vec![vec![-1i16; size]; size];
+/// Build a Data Matrix grid with finder pattern and data, writing the
+/// row-major module grid into `buf[..size * size]`.
+fn build_grid(
+    size: usize,
+    data_codewords: &[u8],
+    ec_codewords: &[u8],
+    buf: &mut [bool],
+) -> Result<(), EncodeError> {
+    let cells = size * size;
+    if buf.len() < cells {
+        return Err(EncodeError::BufferTooSmall);
+    }
+
+    // Tri-state scratch grid: -1 = unplaced, 0 = light, 1 = dark.
+    let mut grid = [-1i16; MAX_CELLS];
+    let at = |r: usize, c: usize| r * size + c;
 
     // Place finder pattern (L-shape: solid dark on bottom row and left column)
-    #[allow(clippy::needless_range_loop)]
     for c in 0..size {
-        grid[size - 1][c] = 1; // bottom row (all dark)
-        grid[0][c] = if c % 2 == 0 { 1 } else { 0 }; // top row (alternating, starts dark)
+        grid[at(size - 1, c)] = 1; // bottom row (all dark)
+        grid[at(0, c)] = if c % 2 == 0 { 1 } else { 0 }; // top row (alternating)
     }
-    #[allow(clippy::needless_range_loop)]
     for r in 0..size {
-        grid[r][0] = 1; // left column (all dark)
-        grid[r][size - 1] = if r % 2 == 0 { 0 } else { 1 }; // right column (alternating, starts light)
+        grid[at(r, 0)] = 1; // left column (all dark)
+        grid[at(r, size - 1)] = if r % 2 == 0 { 0 } else { 1 }; // right column
     }
 
-    // Combine data and EC codewords
-    let mut all_cw: Vec<u8> = Vec::with_capacity(data_codewords.len() + ec_codewords.len());
-    all_cw.extend_from_slice(data_codewords);
-    all_cw.extend_from_slice(ec_codewords);
+    // Combined data + EC codewords, addressed without concatenation.
+    let total_cw = data_codewords.len() + ec_codewords.len();
+    let cw_at = |idx: usize| -> u8 {
+        if idx < data_codewords.len() {
+            data_codewords[idx]
+        } else if idx < total_cw {
+            ec_codewords[idx - data_codewords.len()]
+        } else {
+            0
+        }
+    };
 
-    // Place data using diagonal algorithm (simplified)
+    // Place data using diagonal algorithm (simplified).
     let inner_size = size - 2; // exclude border
     let mut cw_idx = 0usize;
     let mut bit_pos = 0usize;
 
-    // Simple row-by-row placement within the data region
     'outer: for col_start in (1..inner_size + 1).step_by(2).rev() {
         let going_up = (inner_size - col_start) % 4 < 2;
-        let row_range: Vec<usize> = if going_up {
-            (1..inner_size + 1).rev().collect()
-        } else {
-            (1..inner_size + 1).collect()
-        };
 
-        for row in row_range {
+        for k in 0..inner_size {
+            // going_up: inner_size..=1, else 1..=inner_size
+            let row = if going_up { inner_size - k } else { 1 + k };
             for dc in 0..2usize {
                 let c = col_start + dc;
                 if c > inner_size {
                     continue;
                 }
-                if grid[row][c] >= 0 {
+                if grid[at(row, c)] >= 0 {
                     continue; // already placed (finder/timing)
                 }
 
-                let cw = if cw_idx < all_cw.len() {
-                    all_cw[cw_idx]
-                } else {
-                    0
-                };
+                let cw = cw_at(cw_idx);
                 let bit = 7 - (bit_pos % 8);
-                grid[row][c] = ((cw >> bit) & 1) as i16;
+                grid[at(row, c)] = ((cw >> bit) & 1) as i16;
                 bit_pos += 1;
                 if bit_pos.is_multiple_of(8) {
                     cw_idx += 1;
-                    if cw_idx >= all_cw.len() {
+                    if cw_idx >= total_cw {
                         break 'outer;
                     }
                 }
@@ -186,10 +207,11 @@ fn build_grid(size: usize, data_codewords: &[u8], ec_codewords: &[u8]) -> Vec<Ve
         }
     }
 
-    // Convert to bool grid (any -1 treated as light)
-    grid.into_iter()
-        .map(|row| row.into_iter().map(|v| v == 1).collect())
-        .collect()
+    // Convert to bool grid (any -1 treated as light).
+    for i in 0..cells {
+        buf[i] = grid[i] == 1;
+    }
+    Ok(())
 }
 
 // ---- Public encoder --------------------------------------------------------
@@ -203,51 +225,54 @@ fn build_grid(size: usize, data_codewords: &[u8], ec_codewords: &[u8]) -> Vec<Ve
 ///
 /// ```rust
 /// use barcodes::common::traits::BarcodeEncoder;
+/// use barcodes::common::types::Encoded;
 /// use barcodes::twod::datamatrix::DataMatrix;
 ///
-/// let out = DataMatrix::encode("Hello DM").unwrap();
+/// let mut buf = [false; 26 * 26];
+/// let Encoded::Matrix { width, height } = DataMatrix::encode_into("Hello DM", &mut buf).unwrap()
+/// else { unreachable!() };
+/// assert_eq!(width, height);
 /// ```
 pub struct DataMatrix;
 
 impl BarcodeEncoder for DataMatrix {
     type Input = str;
-    type Error = EncodeError;
 
-    fn encode(input: &str) -> Result<BarcodeOutput, EncodeError> {
+    fn encode_into(input: &str, buf: &mut [bool]) -> Result<Encoded, EncodeError> {
         if input.is_empty() {
             return Err(EncodeError::InvalidInput(
-                "Data Matrix input must not be empty".into(),
+                "Data Matrix input must not be empty",
             ));
         }
 
-        let data_cw = ascii_encode(input.as_bytes());
+        // ASCII-encode into a fixed scratch buffer.
+        let mut data_cw = [0u8; MAX_DATA_CW + 1];
+        let n = ascii_encode(input.as_bytes(), &mut data_cw)?;
 
-        // Find the smallest symbol that fits
+        // Find the smallest symbol that fits.
         let params = SYMBOL_PARAMS
             .iter()
-            .find(|&&(_, cap, _, _, _)| data_cw.len() <= cap)
+            .find(|&&(_, cap, _, _, _)| n <= cap)
             .ok_or(EncodeError::DataTooLong)?;
 
         let (size, capacity, .., data_per_block, ec_per_block) = *params;
 
-        // Pad to capacity with padding codeword (129 = ASCII pad)
-        let mut padded = data_cw.clone();
-        while padded.len() < capacity {
-            padded.push(129); // padding
-        }
-        padded.truncate(data_per_block);
+        // Pad to capacity with the padding codeword (129).
+        let mut padded = [129u8; MAX_DATA_CW];
+        padded[..n].copy_from_slice(&data_cw[..n]);
+        let data = &padded[..data_per_block.min(capacity)];
 
-        // Compute RS error correction
-        let ec = rs_encode_dm(&padded, ec_per_block);
+        // Compute RS error correction.
+        let mut ec = [0u8; MAX_EC];
+        rs_encode_dm(data, ec_per_block, &mut ec);
 
-        // Build the grid
-        let grid = build_grid(size, &padded, &ec);
+        // Build the grid directly into the caller buffer.
+        build_grid(size, data, &ec[..ec_per_block], buf)?;
 
-        Ok(BarcodeOutput::Matrix(MatrixBarcode {
+        Ok(Encoded::Matrix {
             width: size,
             height: size,
-            modules: grid,
-        }))
+        })
     }
 
     fn symbology_name() -> &'static str {
@@ -261,57 +286,60 @@ impl BarcodeEncoder for DataMatrix {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_encode_basic() {
-        let out = DataMatrix::encode("Hello").unwrap();
-        match out {
-            BarcodeOutput::Matrix(mb) => {
-                assert!(mb.width >= 10);
-                assert_eq!(mb.width, mb.height);
-            }
-            _ => panic!("expected matrix barcode"),
+    fn encode(input: &str, buf: &mut [bool]) -> (usize, usize) {
+        match DataMatrix::encode_into(input, buf).unwrap() {
+            Encoded::Matrix { width, height } => (width, height),
+            _ => panic!("expected matrix"),
         }
     }
 
     #[test]
+    fn test_encode_basic() {
+        let mut buf = [false; MAX_CELLS];
+        let (w, h) = encode("Hello", &mut buf);
+        assert!(w >= 10);
+        assert_eq!(w, h);
+    }
+
+    #[test]
     fn test_encode_digits() {
-        let out = DataMatrix::encode("12345").unwrap();
-        assert!(matches!(out, BarcodeOutput::Matrix(_)));
+        let mut buf = [false; MAX_CELLS];
+        let (w, _) = encode("12345", &mut buf);
+        assert!(w >= 10);
     }
 
     #[test]
     fn test_finder_pattern() {
-        let out = DataMatrix::encode("A").unwrap();
-        match out {
-            BarcodeOutput::Matrix(mb) => {
-                let size = mb.width;
-                // Bottom row should be all dark (finder)
-                let bottom = &mb.modules[size - 1];
-                assert!(bottom.iter().all(|&b| b), "bottom row should be all dark");
-                // Left column should be all dark (finder)
-                for row in &mb.modules {
-                    assert!(row[0], "left column should be all dark");
-                }
-            }
-            _ => panic!("expected matrix"),
+        let mut buf = [false; MAX_CELLS];
+        let (size, _) = encode("A", &mut buf);
+        // Bottom row should be all dark (finder)
+        let bottom = &buf[(size - 1) * size..size * size];
+        assert!(bottom.iter().all(|&b| b), "bottom row should be all dark");
+        // Left column should be all dark (finder)
+        for r in 0..size {
+            assert!(buf[r * size], "left column should be all dark");
         }
     }
 
     #[test]
     fn test_symbol_size_10x10_for_small_input() {
-        let out = DataMatrix::encode("Hi").unwrap();
-        match out {
-            BarcodeOutput::Matrix(mb) => {
-                assert_eq!(mb.width, 10);
-                assert_eq!(mb.height, 10);
-            }
-            _ => panic!("expected matrix"),
-        }
+        let mut buf = [false; MAX_CELLS];
+        assert_eq!(encode("Hi", &mut buf), (10, 10));
     }
 
     #[test]
     fn test_empty_input() {
-        assert!(DataMatrix::encode("").is_err());
+        let mut buf = [false; MAX_CELLS];
+        assert!(DataMatrix::encode_into("", &mut buf).is_err());
+    }
+
+    #[test]
+    fn test_buffer_too_small() {
+        let mut buf = [false; 16];
+        assert_eq!(
+            DataMatrix::encode_into("Hi", &mut buf),
+            Err(EncodeError::BufferTooSmall)
+        );
     }
 
     #[test]
@@ -319,6 +347,7 @@ mod tests {
         assert_eq!(DataMatrix::symbology_name(), "Data Matrix");
     }
 
+    #[cfg(feature = "alloc")]
     #[test]
     fn test_svg_output() {
         let svg = DataMatrix::encode("Test").unwrap().to_svg_string();

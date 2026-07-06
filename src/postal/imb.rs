@@ -14,13 +14,8 @@
 //! This implementation follows the USPS IMb specification (Publication 197).
 #![forbid(unsafe_code)]
 
-extern crate alloc;
-use alloc::vec::Vec;
-
 use crate::common::{
-    errors::EncodeError,
-    traits::BarcodeEncoder,
-    types::{BarcodeOutput, LinearBarcode},
+    buffer::SliceWriter, errors::EncodeError, traits::BarcodeEncoder, types::Encoded,
 };
 
 // ---- Bar state encoding ----------------------------------------------------
@@ -81,50 +76,28 @@ fn bits_to_bar(ascender: bool, descender: bool) -> BarState {
 /// For the linear output, we encode each bar as: whether a dark module
 /// exists.  The state is encoded in the `height` and `bars` properties by
 /// using the first element to indicate presence.
-fn bar_states_to_modules(states: &[BarState]) -> Vec<bool> {
-    // For linear output, each bar is represented as a single dark module
-    // separated by narrow spaces (light modules)
-    let mut modules: Vec<bool> = Vec::new();
-    for &state in states {
-        // Encode the state: Full/Ascender/Descender/Tracker → always a bar
-        // In a real 4-state renderer, bar height varies; here we just mark presence
+fn bar_states_to_modules(states: &[BarState], buf: &mut [bool]) -> Result<usize, EncodeError> {
+    // For linear output, each bar is a single dark module (Tracker → light)
+    // separated by narrow light spaces.
+    let mut w = SliceWriter::new(buf);
+    for (i, &state) in states.iter().enumerate() {
         let has_bar = !matches!(state, BarState::Tracker);
-        modules.push(has_bar); // bar
-        modules.push(false); // inter-bar space
+        w.push(has_bar)?; // bar
+        if i + 1 < states.len() {
+            w.push(false)?; // inter-bar space
+        }
     }
-    // Remove trailing space
-    if modules.last() == Some(&false) {
-        modules.pop();
-    }
-    modules
-}
-
-// ---- Digit string conversion -----------------------------------------------
-
-fn parse_digits(s: &str) -> Option<Vec<u8>> {
-    let trimmed = s.trim();
-    if trimmed.chars().all(|c| c.is_ascii_digit()) {
-        Some(trimmed.bytes().map(|b| b - b'0').collect())
-    } else {
-        None
-    }
+    Ok(w.len())
 }
 
 // ---- IMb encoding ----------------------------------------------------------
 
 /// Simplified IMb encoding based on the USPS specification.
 ///
-/// Converts the 20-digit barcode identifier into 65 bar states.
-fn encode_imb_bars(digits: &[u8]) -> [BarState; 65] {
-    // Convert digits to a large binary number
-    // 20 digits → 6.6 bits/digit → ~132 bits; we use 65 bar pairs
-
-    // Compute FCS from input bytes
-    let input_bytes: Vec<u8> = digits.iter().map(|&d| d + b'0').collect();
-    let fcs = compute_fcs(&input_bytes);
-
-    // Convert digit string to binary representation
-    // Each bar has an ascender bit and descender bit derived from the data
+/// Converts the 20-digit barcode identifier into 65 bar states.  `fcs` is the
+/// frame check sequence computed from the original ASCII digit bytes.
+fn encode_imb_bars(digits: &[u8], fcs: u16) -> [BarState; 65] {
+    // Each bar has an ascender bit and descender bit derived from the data.
     let mut bars = [BarState::Tracker; 65];
 
     // Simple deterministic assignment based on digit values and FCS
@@ -156,36 +129,48 @@ fn encode_imb_bars(digits: &[u8]) -> [BarState; 65] {
 ///
 /// ```rust
 /// use barcodes::common::traits::BarcodeEncoder;
+/// use barcodes::common::types::Encoded;
 /// use barcodes::postal::imb::Imb;
 ///
-/// let out = Imb::encode("01234567094987654321").unwrap();
+/// let mut buf = [false; 256];
+/// let Encoded::Linear { len, .. } = Imb::encode_into("01234567094987654321", &mut buf).unwrap()
+/// else { unreachable!() };
+/// let bars = &buf[..len];
 /// ```
 pub struct Imb;
 
 impl BarcodeEncoder for Imb {
     type Input = str;
-    type Error = EncodeError;
 
-    fn encode(input: &str) -> Result<BarcodeOutput, EncodeError> {
+    fn encode_into(input: &str, buf: &mut [bool]) -> Result<Encoded, EncodeError> {
         let trimmed = input.trim();
-        let digits = parse_digits(trimmed).ok_or_else(|| {
-            EncodeError::InvalidInput("IMb input must contain digits only".into())
-        })?;
-
-        if digits.len() != 20 && digits.len() != 31 {
+        if !trimmed.chars().all(|c| c.is_ascii_digit()) {
             return Err(EncodeError::InvalidInput(
-                "IMb input must be 20 or 31 digits".into(),
+                "IMb input must contain digits only",
             ));
         }
 
-        let bar_states = encode_imb_bars(&digits);
-        let modules = bar_states_to_modules(&bar_states);
+        let len = trimmed.len();
+        if len != 20 && len != 31 {
+            return Err(EncodeError::InvalidInput(
+                "IMb input must be 20 or 31 digits",
+            ));
+        }
 
-        Ok(BarcodeOutput::Linear(LinearBarcode {
-            bars: modules,
+        // Digit values (0–9) in a fixed stack buffer; ASCII bytes feed the FCS.
+        let mut digits = [0u8; 31];
+        for (i, b) in trimmed.bytes().enumerate() {
+            digits[i] = b - b'0';
+        }
+        let fcs = compute_fcs(trimmed.as_bytes());
+
+        let bar_states = encode_imb_bars(&digits[..len], fcs);
+        let modules = bar_states_to_modules(&bar_states, buf)?;
+
+        Ok(Encoded::Linear {
+            len: modules,
             height: 20, // IMb standard height
-            text: Some(trimmed.into()),
-        }))
+        })
     }
 
     fn symbology_name() -> &'static str {
@@ -199,32 +184,35 @@ impl BarcodeEncoder for Imb {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_encode_20_digits() {
-        let out = Imb::encode("01234567094987654321").unwrap();
-        match out {
-            BarcodeOutput::Linear(lb) => {
-                // 65 bars, each separated by a space = 65 + 64 = 129 modules
-                assert!(!lb.bars.is_empty());
-            }
-            _ => panic!("expected linear barcode"),
+    fn encode_len(input: &str) -> usize {
+        let mut buf = [false; 256];
+        match Imb::encode_into(input, &mut buf).unwrap() {
+            Encoded::Linear { len, .. } => len,
+            _ => panic!("expected linear"),
         }
     }
 
     #[test]
+    fn test_encode_20_digits() {
+        // 65 bars separated by 64 spaces = 129 modules.
+        assert_eq!(encode_len("01234567094987654321"), 129);
+    }
+
+    #[test]
     fn test_encode_31_digits() {
-        let out = Imb::encode("0123456789012345678901234567890").unwrap();
-        assert!(matches!(out, BarcodeOutput::Linear(_)));
+        assert_eq!(encode_len("0123456789012345678901234567890"), 129);
     }
 
     #[test]
     fn test_invalid_length() {
-        assert!(Imb::encode("12345678901234567890123").is_err());
+        let mut buf = [false; 256];
+        assert!(Imb::encode_into("12345678901234567890123", &mut buf).is_err());
     }
 
     #[test]
     fn test_invalid_chars() {
-        assert!(Imb::encode("0123456789012345678X").is_err());
+        let mut buf = [false; 256];
+        assert!(Imb::encode_into("0123456789012345678X", &mut buf).is_err());
     }
 
     #[test]
@@ -232,6 +220,7 @@ mod tests {
         assert_eq!(Imb::symbology_name(), "USPS IMb");
     }
 
+    #[cfg(feature = "alloc")]
     #[test]
     fn test_svg_output() {
         let svg = Imb::encode("01234567094987654321").unwrap().to_svg_string();
