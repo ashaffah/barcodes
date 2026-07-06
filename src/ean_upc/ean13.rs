@@ -21,16 +21,16 @@ use crate::common::{
 
 /// L-code (odd parity) patterns for digits 0–9.  7 modules each.
 pub(crate) const L_CODE: [[bool; 7]; 10] = [
-    [false, false, false, true, true, false, true],  // 0
-    [false, false, true, true, false, false, true],  // 1
-    [false, false, true, false, false, true, true],  // 2
-    [false, true, true, true, true, false, true],    // 3
-    [false, true, false, false, false, true, true],  // 4
-    [false, true, true, false, false, false, true],  // 5
-    [false, true, false, true, true, true, false],   // 6  (corrected EAN spec)
-    [false, true, true, true, false, true, false],   // 7
-    [false, true, true, false, true, true, false],   // 8  (corrected EAN spec)
-    [false, false, false, true, false, true, false], // 9
+    [false, false, false, true, true, false, true], // 0
+    [false, false, true, true, false, false, true], // 1
+    [false, false, true, false, false, true, true], // 2
+    [false, true, true, true, true, false, true],   // 3
+    [false, true, false, false, false, true, true], // 4
+    [false, true, true, false, false, false, true], // 5
+    [false, true, false, true, true, true, true],   // 6
+    [false, true, true, true, false, true, true],   // 7
+    [false, true, true, false, true, true, true],   // 8
+    [false, false, false, true, false, true, true], // 9
 ];
 
 /// G-code (even parity) patterns for digits 0–9.  7 modules each.
