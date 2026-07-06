@@ -16,9 +16,7 @@
 #![forbid(unsafe_code)]
 
 use crate::common::{errors::EncodeError, traits::BarcodeEncoder, types::Encoded};
-use crate::linear::code128::{
-    FNC1, MAX_SYMBOLS, START_B, START_C, STOP, compute_check, symbols_to_bars,
-};
+use crate::linear::code128::{FNC1, MAX_SYMBOLS, START_B, STOP, compute_check, symbols_to_bars};
 
 /// Maximum number of AI segments supported in a single symbol.
 const MAX_SEGMENTS: usize = 32;
@@ -163,6 +161,11 @@ fn parse_gs1<'a>(
 }
 
 /// Build the Code 128 symbol sequence for a GS1-128 barcode, writing bars into `buf`.
+///
+/// The whole message is encoded in Code Set B with a leading FNC1 (the GS1
+/// indicator) and FNC1 separators after variable-length AIs.  Code B encodes
+/// every AI and data byte consistently, so the symbol decodes correctly (Code C
+/// numeric compaction is intentionally not used to avoid mode-switch errors).
 fn build_barcode(segments: &[AiSegment], buf: &mut [bool]) -> Result<usize, EncodeError> {
     let mut symbols = [0u8; MAX_SYMBOLS];
     let mut n = 0;
@@ -176,54 +179,22 @@ fn build_barcode(segments: &[AiSegment], buf: &mut [bool]) -> Result<usize, Enco
         }};
     }
 
-    // Determine if we can start with Code C (all-digit data)
-    let all_numeric = segments
-        .iter()
-        .all(|s| s.data.chars().all(|c| c.is_ascii_digit()));
-
-    let start = if all_numeric { START_C } else { START_B };
-    push!(start);
-
-    // FNC1 immediately after start — signals GS1 application
+    // Start Code B, then FNC1 to mark the symbol as GS1.
+    push!(START_B);
     push!(FNC1);
 
     for (i, seg) in segments.iter().enumerate() {
-        // Encode AI itself using Code B (always printable ASCII digits)
+        // AI digits, then data — all as Code B values.
         for byte in seg.ai.bytes() {
-            push!(byte - 0x20); // Code B value
+            push!(byte - 0x20);
         }
-
-        // Encode data
-        let data_bytes = seg.data.as_bytes();
-        if all_numeric
-            && data_bytes.iter().all(|b| b.is_ascii_digit())
-            && data_bytes.len() % 2 == 0
-            && start == START_C
-        {
-            // Use Code C numeric pairs
-            let mut j = 0;
-            while j + 1 < data_bytes.len() {
-                let tens = data_bytes[j] - b'0';
-                let units = data_bytes[j + 1] - b'0';
-                push!(tens * 10 + units);
-                j += 2;
-            }
-            if j < data_bytes.len() {
-                // Odd byte left, use Code B
-                push!(data_bytes[j] - 0x20);
-            }
-        } else {
-            // Use Code B
-            for &byte in data_bytes {
-                if !(0x20..=0x7E).contains(&byte) {
-                    // Skip invalid bytes; real implementation would return error
-                    continue;
-                }
+        for &byte in seg.data.as_bytes() {
+            if (0x20..=0x7E).contains(&byte) {
                 push!(byte - 0x20);
             }
         }
 
-        // Insert FNC1 separator after variable-length AI (not after the last one)
+        // FNC1 separator after a variable-length AI (not after the last one).
         if i + 1 < segments.len() && !is_fixed_length_ai(seg.ai) {
             push!(FNC1);
         }
