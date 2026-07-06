@@ -2,7 +2,8 @@
 //!
 //! Data Matrix is a 2D matrix barcode widely used in manufacturing, healthcare,
 //! and logistics.  This implementation supports ECC 200 (Reed-Solomon error
-//! correction) for square symbol sizes from 10×10 to 26×26.
+//! correction) for square symbol sizes from 10×10 to 48×48 (up to 174 data
+//! codewords), including the multi-region sizes 32×32–48×48.
 //!
 //! # Structure
 //!
@@ -24,17 +25,26 @@ use crate::common::{
 // ---- Symbol parameters -----------------------------------------------------
 
 /// Parameters for each supported square ECC 200 symbol size.
-/// (total_size, data_capacity_bytes, rs_block_count, data_per_block, ec_per_block)
+///
+/// `(symbol_size, data_region, regions_per_side, data_codewords, ec_codewords)`
+/// where `symbol_size = regions_per_side * (data_region + 2)`.  Only symbols
+/// using a single Reed-Solomon block are listed (sizes 10×10 – 48×48); larger
+/// sizes need interleaved RS blocks and are not yet supported.
 const SYMBOL_PARAMS: &[(usize, usize, usize, usize, usize)] = &[
-    (10, 3, 1, 3, 5),    // 10×10
-    (12, 5, 1, 5, 7),    // 12×12
-    (14, 8, 1, 8, 10),   // 14×14
-    (16, 12, 1, 12, 12), // 16×16
-    (18, 18, 1, 18, 14), // 18×18
-    (20, 22, 1, 22, 18), // 20×20
-    (22, 30, 1, 30, 20), // 22×22
-    (24, 36, 1, 36, 24), // 24×24
-    (26, 44, 1, 44, 28), // 26×26
+    (10, 8, 1, 3, 5),     // 10×10
+    (12, 10, 1, 5, 7),    // 12×12
+    (14, 12, 1, 8, 10),   // 14×14
+    (16, 14, 1, 12, 12),  // 16×16
+    (18, 16, 1, 18, 14),  // 18×18
+    (20, 18, 1, 22, 18),  // 20×20
+    (22, 20, 1, 30, 20),  // 22×22
+    (24, 22, 1, 36, 24),  // 24×24
+    (26, 24, 1, 44, 28),  // 26×26
+    (32, 14, 2, 62, 36),  // 32×32 (2×2 regions)
+    (36, 16, 2, 86, 42),  // 36×36
+    (40, 18, 2, 114, 48), // 40×40
+    (44, 20, 2, 144, 56), // 44×44
+    (48, 22, 2, 174, 68), // 48×48
 ];
 
 // ---- GF(256) for Data Matrix Reed-Solomon ----------------------------------
@@ -274,22 +284,37 @@ fn ecc200_placement(nr: usize, nc: usize) -> Vec<u16> {
 
 /// Build a Data Matrix grid with the standard finder/timing pattern and ECC 200
 /// data placement.
-fn build_grid(size: usize, data_codewords: &[u8], ec_codewords: &[u8]) -> Vec<Vec<bool>> {
+///
+/// `data_region` is the interior data size of one region and `regions` is the
+/// number of regions per side (1 for sizes ≤ 26, 2 for 32–48). Each region is
+/// framed by its own solid-L finder and alternating timing tracks; the data is
+/// placed over the combined `(regions·data_region)` mapping matrix.
+fn build_grid(
+    size: usize,
+    data_region: usize,
+    regions: usize,
+    data_codewords: &[u8],
+    ec_codewords: &[u8],
+) -> Vec<Vec<bool>> {
     let mut grid: Vec<Vec<bool>> = vec![vec![false; size]; size];
 
-    // Finder pattern: solid L on the left column and bottom row.
-    #[allow(clippy::needless_range_loop)]
-    for i in 0..size {
-        grid[size - 1][i] = true; // bottom solid
-        grid[i][0] = true; // left solid
-    }
-    // Timing pattern: top row dark on even columns, right column dark on odd
-    // rows (so both tracks meet the solid L correctly).
-    for i in (0..size).step_by(2) {
-        grid[0][i] = true; // top timing: even columns
-    }
-    for i in (1..size).step_by(2) {
-        grid[i][size - 1] = true; // right timing: odd rows
+    // Finder/timing pattern around every data region.
+    let block = data_region + 2;
+    for br in 0..regions {
+        for bc in 0..regions {
+            let r0 = br * block;
+            let c0 = bc * block;
+            for i in 0..block {
+                grid[r0 + block - 1][c0 + i] = true; // bottom solid
+                grid[r0 + i][c0] = true; // left solid
+            }
+            for i in (0..block).step_by(2) {
+                grid[r0][c0 + i] = true; // top timing: even columns
+            }
+            for i in (1..block).step_by(2) {
+                grid[r0 + i][c0 + block - 1] = true; // right timing: odd rows
+            }
+        }
     }
 
     // Combine data + EC codewords in placement order.
@@ -297,13 +322,13 @@ fn build_grid(size: usize, data_codewords: &[u8], ec_codewords: &[u8]) -> Vec<Ve
     all_cw.extend_from_slice(data_codewords);
     all_cw.extend_from_slice(ec_codewords);
 
-    // Standard ECC 200 placement into the (size-2) × (size-2) data region.
-    let nr = size - 2;
-    let nc = size - 2;
-    let places = ecc200_placement(nr, nc);
-    for mr in 0..nr {
-        for mc in 0..nc {
-            let v = places[mr * nc + mc];
+    // Standard ECC 200 placement over the combined mapping matrix, then map each
+    // logical cell into its region's interior (offset past that region's border).
+    let mapping = regions * data_region;
+    let places = ecc200_placement(mapping, mapping);
+    for mr in 0..mapping {
+        for mc in 0..mapping {
+            let v = places[mr * mapping + mc];
             let dark = match v {
                 0 => false,
                 1 => true,
@@ -312,7 +337,9 @@ fn build_grid(size: usize, data_codewords: &[u8], ec_codewords: &[u8]) -> Vec<Ve
                     (cw >> (v & 7)) & 1 == 1
                 }
             };
-            grid[mr + 1][mc + 1] = dark;
+            let pr = (mr / data_region) * block + 1 + (mr % data_region);
+            let pc = (mc / data_region) * block + 1 + (mc % data_region);
+            grid[pr][pc] = dark;
         }
     }
 
@@ -324,7 +351,7 @@ fn build_grid(size: usize, data_codewords: &[u8], ec_codewords: &[u8]) -> Vec<Ve
 /// Data Matrix ECC 200 barcode encoder.
 ///
 /// Encodes text input into a square Data Matrix symbol.  The smallest symbol
-/// that fits the data is automatically selected (10×10 to 26×26).
+/// that fits the data is automatically selected (10×10 to 48×48).
 ///
 /// # Example
 ///
@@ -349,26 +376,32 @@ impl BarcodeEncoder for DataMatrix {
 
         let data_cw = ascii_encode(input.as_bytes());
 
-        // Find the smallest symbol that fits
+        // Find the smallest symbol whose data capacity fits.
         let params = SYMBOL_PARAMS
             .iter()
-            .find(|&&(_, cap, _, _, _)| data_cw.len() <= cap)
+            .find(|&&(_, _, _, data_cap, _)| data_cw.len() <= data_cap)
             .ok_or(EncodeError::DataTooLong)?;
 
-        let (size, capacity, .., data_per_block, ec_per_block) = *params;
+        let (size, data_region, regions, data_cap, ec_count) = *params;
 
-        // Pad to capacity with padding codeword (129 = ASCII pad)
+        // Pad to the data capacity. ECC 200 uses codeword 129 for the first
+        // pad, then the "253-state" pseudo-random algorithm for the rest.
         let mut padded = data_cw.clone();
-        while padded.len() < capacity {
-            padded.push(129); // padding
+        if padded.len() < data_cap {
+            padded.push(129);
+            while padded.len() < data_cap {
+                let pos = padded.len() + 1; // 1-based codeword position
+                let r = ((149 * pos) % 253) + 1;
+                let v = 129 + r;
+                padded.push(if v > 254 { (v - 254) as u8 } else { v as u8 });
+            }
         }
-        padded.truncate(data_per_block);
 
-        // Compute RS error correction
-        let ec = rs_encode_dm(&padded, ec_per_block);
+        // Compute RS error correction over the padded data.
+        let ec = rs_encode_dm(&padded, ec_count);
 
-        // Build the grid
-        let grid = build_grid(size, &padded, &ec);
+        // Build the grid.
+        let grid = build_grid(size, data_region, regions, &padded, &ec);
 
         Ok(BarcodeOutput::Matrix(MatrixBarcode {
             width: size,
@@ -471,18 +504,21 @@ mod tests {
 
     /// Recover the codeword stream from a rendered symbol by inverting the
     /// standard placement — verifies finder/timing offset and bit placement.
-    fn recover_codewords(mb: &MatrixBarcode) -> Vec<u8> {
-        let size = mb.width;
-        let nr = size - 2;
-        let nc = size - 2;
-        let places = ecc200_placement(nr, nc);
-        let capacity = nr * nc / 8;
+    fn recover_codewords(mb: &MatrixBarcode, data_region: usize, regions: usize) -> Vec<u8> {
+        let block = data_region + 2;
+        let mapping = regions * data_region;
+        let places = ecc200_placement(mapping, mapping);
+        let capacity = mapping * mapping / 8;
         let mut cw = vec![0u8; capacity];
-        for mr in 0..nr {
-            for mc in 0..nc {
-                let v = places[mr * nc + mc];
-                if v > 1 && mb.modules[mr + 1][mc + 1] {
-                    cw[(v >> 3) as usize - 1] |= 1 << (v & 7);
+        for mr in 0..mapping {
+            for mc in 0..mapping {
+                let v = places[mr * mapping + mc];
+                if v > 1 {
+                    let pr = (mr / data_region) * block + 1 + (mr % data_region);
+                    let pc = (mc / data_region) * block + 1 + (mc % data_region);
+                    if mb.modules[pr][pc] {
+                        cw[(v >> 3) as usize - 1] |= 1 << (v & 7);
+                    }
                 }
             }
         }
@@ -518,6 +554,7 @@ mod tests {
             "HELLO WORLD",
             "f3411c82-1c70-4207-977e-99f5580e7e3b",
             "The quick brown fox jumps over the lazy do", // 42 chars → 26×26
+            "Data Matrix ECC 200 large capacity test crossing past the single-region 44-codeword boundary into 32x32.", // → multi-region
         ];
         for input in inputs {
             let mb = match DataMatrix::encode(input).unwrap() {
@@ -526,14 +563,14 @@ mod tests {
             };
             let size = mb.width;
             let params = SYMBOL_PARAMS.iter().find(|p| p.0 == size).unwrap();
-            let (_, _, _, data_per_block, ec_per_block) = *params;
+            let (_, data_region, regions, data_cap, ec_count) = *params;
 
-            let all_cw = recover_codewords(&mb);
-            let (data, ec) = all_cw.split_at(data_per_block);
+            let all_cw = recover_codewords(&mb, data_region, regions);
+            let (data, ec) = all_cw.split_at(data_cap);
 
             // Reed-Solomon must be consistent with the recovered data.
             assert_eq!(
-                rs_encode_dm(data, ec_per_block),
+                rs_encode_dm(data, ec_count),
                 ec,
                 "RS mismatch for {input:?} ({size}x{size})"
             );
@@ -561,5 +598,38 @@ mod tests {
         // Right timing: dark at odd rows, light at even.
         assert!(mb.modules[1][n], "right timing odd row dark");
         assert!(!mb.modules[0][n], "right timing even row light");
+    }
+
+    /// ECC 200 padding: first codeword 129, then the 253-state pseudo-random
+    /// sequence — pinned to the values produced by libdmtx's `dmtxwrite`.
+    #[test]
+    fn test_padding_253_state() {
+        // 50 'A' → 32×32 (62 data cap): 50 data + 12 pad codewords.
+        let s: alloc::string::String = core::iter::repeat_n('A', 50).collect();
+        let mb = match DataMatrix::encode(&s).unwrap() {
+            BarcodeOutput::Matrix(mb) => mb,
+            _ => panic!(),
+        };
+        assert_eq!(mb.width, 32);
+        let all_cw = recover_codewords(&mb, 14, 2);
+        let pads = &all_cw[50..62];
+        assert_eq!(
+            pads,
+            &[129, 34, 184, 79, 229, 124, 20, 170, 65, 215, 110, 6]
+        );
+    }
+
+    /// Multi-region symbols hold much more data than the old 44-codeword cap.
+    #[test]
+    fn test_large_capacity() {
+        let s: alloc::string::String = core::iter::repeat_n('A', 174).collect();
+        let mb = match DataMatrix::encode(&s).unwrap() {
+            BarcodeOutput::Matrix(mb) => mb,
+            _ => panic!(),
+        };
+        assert_eq!(mb.width, 48); // 48×48, 174 data codewords
+        // Beyond the largest single-block symbol is still rejected cleanly.
+        let too_long: alloc::string::String = core::iter::repeat_n('A', 200).collect();
+        assert_eq!(DataMatrix::encode(&too_long), Err(EncodeError::DataTooLong));
     }
 }
