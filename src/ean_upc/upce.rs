@@ -45,16 +45,16 @@ const GUARD_END: [bool; 6] = [false, true, false, true, false, true];
 /// Parity pattern for UPC-E indexed by check digit (0–9).
 /// `false` = L-code, `true` = G-code for positions 0..6.
 const UPCE_PARITY: [[bool; 6]; 10] = [
-    [false, false, false, true, true, true], // 0
-    [false, false, true, false, true, true], // 1
-    [false, false, true, true, false, true], // 2
-    [false, false, true, true, true, false], // 3
-    [false, true, false, false, true, true], // 4
-    [false, true, true, false, false, true], // 5
-    [false, true, true, true, false, false], // 6
-    [false, true, false, true, false, true], // 7
-    [false, true, false, true, true, false], // 8
-    [false, true, true, false, true, false], // 9
+    [true, true, true, false, false, false], // 0  EEEOOO
+    [true, true, false, true, false, false], // 1  EEOEOO
+    [true, true, false, false, true, false], // 2  EEOOEO
+    [true, true, false, false, false, true], // 3  EEOOOE
+    [true, false, true, true, false, false], // 4  EOEEOO
+    [true, false, false, true, true, false], // 5  EOOEEO
+    [true, false, false, false, true, true], // 6  EOOOEE
+    [true, false, true, false, true, false], // 7  EOEOEO
+    [true, false, true, false, false, true], // 8  EOEOOE
+    [true, false, false, true, false, true], // 9  EOOEOE
 ];
 
 // ---- Public encoder --------------------------------------------------------

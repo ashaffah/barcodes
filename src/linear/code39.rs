@@ -25,179 +25,178 @@ use crate::common::{
 
 // ---- Encoding table --------------------------------------------------------
 const CODE39_TABLE: &[(char, [bool; 9])] = &[
-    // char  b0     s0     b1     s1     b2     s2     b3     s3     b4
     (
         '0',
         [false, false, false, true, true, false, true, false, false],
-    ),
+    ), // 0
     (
         '1',
-        [true, false, false, false, false, true, false, false, true],
-    ),
+        [true, false, false, true, false, false, false, false, true],
+    ), // 1
     (
         '2',
-        [false, false, true, false, false, true, false, false, true],
-    ),
+        [false, false, true, true, false, false, false, false, true],
+    ), // 2
     (
         '3',
-        [true, false, true, false, false, true, false, false, false],
-    ),
+        [true, false, true, true, false, false, false, false, false],
+    ), // 3
     (
         '4',
-        [false, false, false, true, false, true, false, false, true],
-    ),
+        [false, false, false, true, true, false, false, false, true],
+    ), // 4
     (
         '5',
-        [true, false, false, true, false, true, false, false, false],
-    ),
+        [true, false, false, true, true, false, false, false, false],
+    ), // 5
     (
         '6',
-        [false, false, true, true, false, true, false, false, false],
-    ),
+        [false, false, true, true, true, false, false, false, false],
+    ), // 6
     (
         '7',
-        [false, false, false, false, true, true, false, false, true],
-    ),
+        [false, false, false, true, false, false, true, false, true],
+    ), // 7
     (
         '8',
-        [true, false, false, false, true, true, false, false, false],
-    ),
+        [true, false, false, true, false, false, true, false, false],
+    ), // 8
     (
         '9',
-        [false, false, true, false, true, true, false, false, false],
-    ),
+        [false, false, true, true, false, false, true, false, false],
+    ), // 9
     (
         'A',
-        [true, false, false, false, false, false, true, false, true],
-    ),
+        [true, false, false, false, false, true, false, false, true],
+    ), // A
     (
         'B',
-        [false, false, true, false, false, false, true, false, true],
-    ),
+        [false, false, true, false, false, true, false, false, true],
+    ), // B
     (
         'C',
-        [true, false, true, false, false, false, true, false, false],
-    ),
+        [true, false, true, false, false, true, false, false, false],
+    ), // C
     (
         'D',
-        [false, false, false, true, false, false, true, false, true],
-    ),
+        [false, false, false, false, true, true, false, false, true],
+    ), // D
     (
         'E',
-        [true, false, false, true, false, false, true, false, false],
-    ),
+        [true, false, false, false, true, true, false, false, false],
+    ), // E
     (
         'F',
-        [false, false, true, true, false, false, true, false, false],
-    ),
+        [false, false, true, false, true, true, false, false, false],
+    ), // F
     (
         'G',
-        [false, false, false, false, true, false, true, false, true],
-    ),
+        [false, false, false, false, false, true, true, false, true],
+    ), // G
     (
         'H',
-        [true, false, false, false, true, false, true, false, false],
-    ),
+        [true, false, false, false, false, true, true, false, false],
+    ), // H
     (
         'I',
-        [false, false, true, false, true, false, true, false, false],
-    ),
+        [false, false, true, false, false, true, true, false, false],
+    ), // I
     (
         'J',
-        [false, false, false, true, true, false, true, false, false],
-    ),
+        [false, false, false, false, true, true, true, false, false],
+    ), // J
     (
         'K',
         [true, false, false, false, false, false, false, true, true],
-    ),
+    ), // K
     (
         'L',
         [false, false, true, false, false, false, false, true, true],
-    ),
+    ), // L
     (
         'M',
         [true, false, true, false, false, false, false, true, false],
-    ),
+    ), // M
     (
         'N',
-        [false, false, false, true, false, false, false, true, true],
-    ),
+        [false, false, false, false, true, false, false, true, true],
+    ), // N
     (
         'O',
-        [true, false, false, true, false, false, false, true, false],
-    ),
+        [true, false, false, false, true, false, false, true, false],
+    ), // O
     (
         'P',
-        [false, false, true, true, false, false, false, true, false],
-    ),
+        [false, false, true, false, true, false, false, true, false],
+    ), // P
     (
         'Q',
-        [false, false, false, false, true, false, false, true, true],
-    ),
+        [false, false, false, false, false, false, true, true, true],
+    ), // Q
     (
         'R',
-        [true, false, false, false, true, false, false, true, false],
-    ),
+        [true, false, false, false, false, false, true, true, false],
+    ), // R
     (
         'S',
-        [false, false, true, false, true, false, false, true, false],
-    ),
+        [false, false, true, false, false, false, true, true, false],
+    ), // S
     (
         'T',
-        [false, false, false, true, true, false, false, true, false],
-    ),
+        [false, false, false, false, true, false, true, true, false],
+    ), // T
     (
         'U',
         [true, true, false, false, false, false, false, false, true],
-    ),
+    ), // U
     (
         'V',
         [false, true, true, false, false, false, false, false, true],
-    ),
+    ), // V
     (
         'W',
         [true, true, true, false, false, false, false, false, false],
-    ),
+    ), // W
     (
         'X',
-        [false, true, false, true, false, false, false, false, true],
-    ),
+        [false, true, false, false, true, false, false, false, true],
+    ), // X
     (
         'Y',
-        [true, true, false, true, false, false, false, false, false],
-    ),
+        [true, true, false, false, true, false, false, false, false],
+    ), // Y
     (
         'Z',
-        [false, true, true, true, false, false, false, false, false],
-    ),
+        [false, true, true, false, true, false, false, false, false],
+    ), // Z
     (
         '-',
-        [false, true, false, false, true, false, false, false, true],
-    ),
+        [false, true, false, false, false, false, true, false, true],
+    ), // -
     (
         '.',
-        [true, true, false, false, true, false, false, false, false],
-    ),
+        [true, true, false, false, false, false, true, false, false],
+    ), // .
     (
         ' ',
-        [false, true, true, false, true, false, false, false, false],
-    ),
+        [false, true, true, false, false, false, true, false, false],
+    ), // space
     (
         '$',
         [false, true, false, true, false, true, false, false, false],
-    ),
+    ), // $
     (
         '/',
-        [false, true, false, false, false, true, false, true, false],
-    ),
+        [false, true, false, true, false, false, false, true, false],
+    ), // /
     (
         '+',
-        [false, true, false, false, false, false, false, true, false],
-    ),
+        [false, true, false, false, false, true, false, true, false],
+    ), // +
     (
         '%',
         [false, false, false, true, false, true, false, true, false],
-    ),
+    ), // %
     (
         '*',
         [false, true, false, false, true, false, true, false, false],
