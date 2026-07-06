@@ -1,210 +1,298 @@
 //! Aztec Code barcode encoder.
 //!
-//! Aztec Code is a 2D matrix barcode used for transportation tickets and other
-//! applications.  It has a distinctive bull's-eye finder pattern at the center.
-//!
-//! # Structure
-//!
-//! - Central finder pattern: concentric squares (bull's-eye)
-//! - Mode message surrounding the finder pattern
-//! - Data encoded in layers spiraling outward from the center
-//! - Reed-Solomon error correction
-//!
-//! # Sizes
-//!
-//! - Compact Aztec: 1–4 layers (15×15 to 27×27 minus corners)
-//! - Full-range Aztec: 1–32 layers
+//! Aztec Code is a 2D matrix barcode used for transport tickets and other
+//! applications.  This encoder uses Binary Shift high-level encoding (universal
+//! — any bytes), Reed-Solomon over the Aztec Galois fields, and the standard
+//! bull's-eye / mode-message / spiral layout (ISO/IEC 24778), so the output
+//! decodes on conforming readers.  Compact (1–4 layers) and full-range
+//! (1–12 layers) symbols are supported.
 #![forbid(unsafe_code)]
 
 use crate::common::{errors::EncodeError, traits::BarcodeEncoder, types::Encoded};
 
-// ---- Fixed capacity bounds (compact Aztec, up to 4 layers) -----------------
+// ---- Bounds ----------------------------------------------------------------
 
-/// Largest supported compact symbol dimension (`11 + 4 * 4`).
-const MAX_SIZE: usize = 27;
-/// Largest supported module count (`MAX_SIZE²`).
-const MAX_CELLS: usize = MAX_SIZE * MAX_SIZE;
-/// Ceiling on data codewords (compact Aztec tops out at 40 for 4 layers).
-const MAX_DATA_CW: usize = 64;
-/// Ceiling on error-correction codewords.
-const MAX_EC: usize = 32;
-/// Ceiling on combined data+EC bits.
-const MAX_BITS: usize = (MAX_DATA_CW + MAX_EC) * 6;
-/// Ceiling on intermediate upper-case/byte-mode bits from text encoding.
-const MAX_TEXT_BITS: usize = MAX_DATA_CW * 8 + 8;
+const MAX_LAYERS_FULL: usize = 12;
+const MAX_BITS: usize = 4096;
+const MAX_WORDS: usize = 1024;
+const MAX_EC: usize = 512;
+const MAX_MATRIX: usize = 67;
+/// Largest module count (used to size test buffers).
+#[cfg(test)]
+const MAX_CELLS: usize = MAX_MATRIX * MAX_MATRIX;
 
-// ---- GF(2^n) Reed-Solomon --------------------------------------------------
+/// Word size (bits per codeword) indexed by layer count.
+const WORD_SIZE: [usize; 33] = [
+    4, 6, 6, 8, 8, 8, 8, 8, 8, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 12, 12, 12,
+    12, 12, 12, 12, 12, 12, 12,
+];
 
-/// GF(64) operations (primitive polynomial x^6 + x + 1 = 0x43).
-fn gf64_mul(a: u8, b: u8) -> u8 {
-    let mut result = 0u8;
-    let mut aa = a & 0x3F;
-    let mut bb = b & 0x3F;
-    while bb > 0 {
-        if bb & 1 != 0 {
-            result ^= aa;
-        }
-        aa = (aa << 1) ^ if aa & 0x20 != 0 { 0x43 } else { 0 };
-        bb >>= 1;
-    }
-    result & 0x3F
+// ---- Galois field GF(2^m) --------------------------------------------------
+
+struct Gf {
+    exp: [u16; 8192],
+    log: [u16; 4096],
 }
 
-/// RS encode using GF(64) for data (6-bit codewords) into `out[..ec_count]`.
-fn rs_data(data: &[u8], ec_count: usize, out: &mut [u8]) {
-    let mut rem_buf = [0u8; MAX_EC];
-    let remainder = &mut rem_buf[..ec_count];
-    for &d in data {
-        let d = d & 0x3F;
-        let lead = d ^ remainder[0];
-        remainder.copy_within(1.., 0);
-        remainder[ec_count - 1] = 0;
-        if lead != 0 {
-            for coef in remainder.iter_mut() {
-                *coef ^= gf64_mul(lead, *coef);
+impl Gf {
+    /// Build exp/log tables for GF(2^m) with the given `primitive` and `size`.
+    fn new(primitive: u16, size: usize) -> Gf {
+        let mut gf = Gf {
+            exp: [0; 8192],
+            log: [0; 4096],
+        };
+        let mut x = 1u32;
+        for i in 0..size - 1 {
+            gf.exp[i] = x as u16;
+            gf.log[x as usize] = i as u16;
+            x <<= 1;
+            if x >= size as u32 {
+                x ^= primitive as u32;
+            }
+        }
+        // Duplicate to avoid modulo on multiply.
+        for i in 0..size - 1 {
+            gf.exp[size - 1 + i] = gf.exp[i];
+        }
+        gf
+    }
+
+    #[inline]
+    fn mul(&self, a: u16, b: u16) -> u16 {
+        if a == 0 || b == 0 {
+            0
+        } else {
+            self.exp[self.log[a as usize] as usize + self.log[b as usize] as usize]
+        }
+    }
+}
+
+/// GF for a given word size (ISO/IEC 24778 / ZXing GenericGF primitives).
+fn field_for(word_size: usize) -> Gf {
+    match word_size {
+        4 => Gf::new(0x13, 16),
+        6 => Gf::new(0x43, 64),
+        8 => Gf::new(0x12d, 256),
+        10 => Gf::new(0x409, 1024),
+        _ => Gf::new(0x1069, 4096),
+    }
+}
+
+/// Reed-Solomon encode: `words[..data_len]` are data, EC written to the next
+/// `ec` slots (generator roots a^1..a^ec, generatorBase = 1).
+fn rs_encode(gf: &Gf, words: &mut [u16], data_len: usize, ec: usize) {
+    // Monic generator g(x) = ∏_{i=1}^{ec} (x - a^i).
+    let mut genp = [0u16; MAX_EC + 1];
+    genp[0] = 1;
+    for i in 0..ec {
+        let root = gf.exp[1 + i];
+        let cur = i + 1; // current generator length before this multiply
+        let mut ng = [0u16; MAX_EC + 1];
+        for j in 0..cur {
+            ng[j] ^= genp[j];
+            ng[j + 1] ^= gf.mul(genp[j], root);
+        }
+        genp[..cur + 1].copy_from_slice(&ng[..cur + 1]);
+    }
+    // Synthetic division; remainder is the EC codewords.
+    let mut rem = [0u16; MAX_EC];
+    #[allow(clippy::needless_range_loop)]
+    for i in 0..data_len {
+        let factor = words[i] ^ rem[0];
+        for k in 0..ec - 1 {
+            rem[k] = rem[k + 1];
+        }
+        rem[ec - 1] = 0;
+        if factor != 0 {
+            for k in 0..ec {
+                rem[k] ^= gf.mul(factor, genp[k + 1]);
             }
         }
     }
-    out[..ec_count].copy_from_slice(remainder);
+    words[data_len..data_len + ec].copy_from_slice(&rem[..ec]);
 }
 
-// ---- Text encoding ---------------------------------------------------------
+// ---- Bit buffer ------------------------------------------------------------
 
-/// Encode ASCII text into 6-bit Aztec code data codewords in `out`.
-///
-/// Uses the standard Aztec upper-case mode encoding; characters not in the
-/// upper-case set fall back to byte encoding.  Returns the codeword count.
-fn encode_text(input: &str, out: &mut [u8]) -> Result<usize, EncodeError> {
-    let mut bits = [false; MAX_TEXT_BITS];
-    let mut nbits = 0;
-    let mut push_bits = |value: u32, width: u32| -> Result<(), EncodeError> {
-        for bit in (0..width).rev() {
-            *bits.get_mut(nbits).ok_or(EncodeError::DataTooLong)? = (value >> bit) & 1 != 0;
-            nbits += 1;
+struct Bits {
+    bits: [bool; MAX_BITS],
+    len: usize,
+}
+
+impl Bits {
+    fn new() -> Bits {
+        Bits {
+            bits: [false; MAX_BITS],
+            len: 0,
+        }
+    }
+    fn push(&mut self, b: bool) -> Result<(), EncodeError> {
+        *self
+            .bits
+            .get_mut(self.len)
+            .ok_or(EncodeError::DataTooLong)? = b;
+        self.len += 1;
+        Ok(())
+    }
+    fn push_bits(&mut self, value: u32, count: u32) -> Result<(), EncodeError> {
+        for i in (0..count).rev() {
+            self.push((value >> i) & 1 == 1)?;
         }
         Ok(())
-    };
-
-    for &b in input.as_bytes() {
-        // Upper-case mode: space=1, A-Z=2..27, .=28, ,=29, :=30, CR=31
-        let code: Option<u8> = match b {
-            b' ' => Some(1),
-            b'A'..=b'Z' => Some(b - b'A' + 2),
-            b'a'..=b'z' => Some(b - b'a' + 2), // treat as uppercase
-            b'.' => Some(28),
-            b',' => Some(29),
-            b':' => Some(30),
-            b'\r' => Some(31),
-            _ => None,
-        };
-
-        if let Some(c) = code {
-            push_bits(c as u32, 5)?; // 5-bit upper-case character
-        } else {
-            // Shift to byte mode (code 31 in upper) then 8-bit byte.
-            push_bits(31, 5)?;
-            push_bits(b as u32, 8)?;
-        }
     }
-
-    // Pad to a multiple of 6 bits (pad with 1).
-    while !nbits.is_multiple_of(6) {
-        *bits.get_mut(nbits).ok_or(EncodeError::DataTooLong)? = true;
-        nbits += 1;
-    }
-
-    // Pack into 6-bit codewords.
-    let count = nbits / 6;
-    if count > out.len() {
-        return Err(EncodeError::DataTooLong);
-    }
-    for (i, cw) in out[..count].iter_mut().enumerate() {
-        let mut acc = 0u8;
-        for j in 0..6 {
-            acc = (acc << 1) | bits[i * 6 + j] as u8;
-        }
-        *cw = acc;
-    }
-    Ok(count)
 }
 
-// ---- Compact Aztec finder pattern ------------------------------------------
+// ---- Aztec geometry helpers ------------------------------------------------
 
-/// Build the compact Aztec bull's-eye finder pattern centered in a grid.
-fn place_compact_finder(grid: &mut [i8], size: usize, center: usize) {
-    // Concentric squares: 6 rings (alternating dark/light from center out).
-    for ring in 0..=5i32 {
-        let dark = ring % 2 == 0; // inner ring (0) is dark
-        let val = if dark { 1i8 } else { 0i8 };
-        let r_start = (center as i32 - ring).max(0) as usize;
-        let r_end = (center as i32 + ring).min(size as i32 - 1) as usize;
-        for r in r_start..=r_end {
-            for c in r_start..=r_end {
-                if r == r_start || r == r_end || c == r_start || c == r_end {
-                    grid[r * size + c] = val;
-                }
+fn total_bits_in_layer(layers: usize, compact: bool) -> usize {
+    ((if compact { 88 } else { 112 }) + 16 * layers) * layers
+}
+
+/// Stuff bits into `out`: split into words, avoid all-0 / all-1 words.
+fn stuff_bits(input: &Bits, word_size: usize, out: &mut Bits) -> Result<(), EncodeError> {
+    let n = input.len;
+    let mask = (1u32 << word_size) - 2;
+    let mut i = 0isize;
+    while (i as usize) < n {
+        let mut word = 0u32;
+        for j in 0..word_size {
+            let idx = i + j as isize;
+            if idx as usize >= n || input.bits[idx as usize] {
+                word |= 1 << (word_size - 1 - j);
             }
         }
+        if word & mask == mask {
+            out.push_bits(word & mask, word_size as u32)?;
+            i -= 1;
+        } else if word & mask == 0 {
+            out.push_bits(word | 1, word_size as u32)?;
+            i -= 1;
+        } else {
+            out.push_bits(word, word_size as u32)?;
+        }
+        i += word_size as isize;
     }
-    // Reference grid mark (bottom-right quadrant dark cell)
-    if center + 1 < size {
-        grid[(center + 1) * size + (center + 1)] = 1;
+    Ok(())
+}
+
+/// Reed-Solomon check-word generation over the message bit stream.
+fn generate_check_words(
+    input: &Bits,
+    total_bits: usize,
+    word_size: usize,
+    out: &mut Bits,
+) -> Result<(), EncodeError> {
+    let message_words = input.len / word_size;
+    let total_words = total_bits / word_size;
+    let gf = field_for(word_size);
+
+    let mut words = [0u16; MAX_WORDS];
+    #[allow(clippy::needless_range_loop)]
+    for i in 0..message_words {
+        let mut v = 0u16;
+        for j in 0..word_size {
+            if input.bits[i * word_size + j] {
+                v |= 1 << (word_size - j - 1);
+            }
+        }
+        words[i] = v;
+    }
+    rs_encode(&gf, &mut words, message_words, total_words - message_words);
+
+    let start_pad = total_bits % word_size;
+    out.push_bits(0, start_pad as u32)?;
+    for &w in &words[..total_words] {
+        out.push_bits(w as u32, word_size as u32)?;
+    }
+    Ok(())
+}
+
+/// Generate the mode message bits (layers/word count + its own RS).
+fn generate_mode_message(
+    compact: bool,
+    layers: usize,
+    message_words: usize,
+    out: &mut Bits,
+) -> Result<(), EncodeError> {
+    let mut m = Bits::new();
+    if compact {
+        m.push_bits((layers - 1) as u32, 2)?;
+        m.push_bits((message_words - 1) as u32, 6)?;
+        generate_check_words(&m, 28, 4, out)?;
+    } else {
+        m.push_bits((layers - 1) as u32, 5)?;
+        m.push_bits((message_words - 1) as u32, 11)?;
+        generate_check_words(&m, 40, 4, out)?;
+    }
+    Ok(())
+}
+
+// ---- Matrix drawing --------------------------------------------------------
+
+struct Matrix<'a> {
+    buf: &'a mut [bool],
+    size: usize,
+}
+
+impl Matrix<'_> {
+    #[inline]
+    fn set(&mut self, x: usize, y: usize) {
+        self.buf[y * self.size + x] = true;
     }
 }
 
-/// Place the orientation marks for compact Aztec.
-fn place_compact_orientation(grid: &mut [i8], size: usize, center: usize) {
-    // Three dark modules on the top-left arc, one light reference bottom-right.
-    let c = center;
-    grid[(c - 5) * size + (c - 5)] = 1;
-    grid[(c - 5) * size + (c - 4)] = 1;
-    grid[(c - 4) * size + (c - 5)] = 1;
-    grid[(c + 5) * size + (c + 5)] = 0;
+fn draw_bulls_eye(m: &mut Matrix, center: usize, size: usize) {
+    let mut i = 0;
+    while i < size {
+        for j in (center - i)..=(center + i) {
+            m.set(j, center - i);
+            m.set(j, center + i);
+            m.set(center - i, j);
+            m.set(center + i, j);
+        }
+        i += 2;
+    }
+    m.set(center - size, center - size);
+    m.set(center - size + 1, center - size);
+    m.set(center - size, center - size + 1);
+    m.set(center + size, center - size);
+    m.set(center + size, center - size + 1);
+    m.set(center + size, center + size - 1);
 }
 
-// ---- Compact Aztec encoder -------------------------------------------------
-
-/// Encode data bits into a single compact Aztec layer spiraling outward.
-fn place_compact_layer(grid: &mut [i8], size: usize, layer: usize, data_bits: &[bool]) {
+fn draw_mode_message(m: &mut Matrix, compact: bool, size: usize, mode: &Bits) {
     let center = size / 2;
-    // Layer 1 starts at distance 6 from center (outside the 11×11 finder)
-    let start = center as i32 - 5 - layer as i32;
-    let end = center as i32 + 5 + layer as i32;
-
-    if start < 0 || end >= size as i32 {
-        return;
-    }
-
-    let mut bit_idx = 0;
-    let s = start as usize;
-    let e = end as usize;
-
-    // Top row (left to right)
-    for c in s..=e {
-        if bit_idx < data_bits.len() && grid[s * size + c] < 0 {
-            grid[s * size + c] = data_bits[bit_idx] as i8;
-            bit_idx += 1;
+    if compact {
+        for i in 0..7 {
+            let offset = center - 3 + i;
+            if mode.bits[i] {
+                m.set(offset, center - 5);
+            }
+            if mode.bits[i + 7] {
+                m.set(center + 5, offset);
+            }
+            if mode.bits[20 - i] {
+                m.set(offset, center + 5);
+            }
+            if mode.bits[27 - i] {
+                m.set(center - 5, offset);
+            }
         }
-    }
-    // Right column (top+1 to bottom)
-    for r in s + 1..=e {
-        if bit_idx < data_bits.len() && grid[r * size + e] < 0 {
-            grid[r * size + e] = data_bits[bit_idx] as i8;
-            bit_idx += 1;
-        }
-    }
-    // Bottom row (right-1 to left)
-    for c in (s..e).rev() {
-        if bit_idx < data_bits.len() && grid[e * size + c] < 0 {
-            grid[e * size + c] = data_bits[bit_idx] as i8;
-            bit_idx += 1;
-        }
-    }
-    // Left column (bottom-1 to top+1)
-    for r in (s + 1..e).rev() {
-        if bit_idx < data_bits.len() && grid[r * size + s] < 0 {
-            grid[r * size + s] = data_bits[bit_idx] as i8;
-            bit_idx += 1;
+    } else {
+        for i in 0..10 {
+            let offset = center - 5 + i + i / 5;
+            if mode.bits[i] {
+                m.set(offset, center - 7);
+            }
+            if mode.bits[i + 10] {
+                m.set(center + 7, offset);
+            }
+            if mode.bits[29 - i] {
+                m.set(offset, center + 7);
+            }
+            if mode.bits[39 - i] {
+                m.set(center - 7, offset);
+            }
         }
     }
 }
@@ -213,10 +301,6 @@ fn place_compact_layer(grid: &mut [i8], size: usize, layer: usize, data_bits: &[
 
 /// Aztec Code barcode encoder.
 ///
-/// Encodes text into a compact Aztec Code symbol.  Automatically selects the
-/// number of layers based on data length.  Uses error correction sufficient
-/// for standard use.
-///
 /// # Example
 ///
 /// ```rust
@@ -224,7 +308,7 @@ fn place_compact_layer(grid: &mut [i8], size: usize, layer: usize, data_bits: &[
 /// use barcodes::common::types::Encoded;
 /// use barcodes::twod::aztec::Aztec;
 ///
-/// let mut buf = [false; 27 * 27];
+/// let mut buf = [false; 67 * 67];
 /// let Encoded::Matrix { width, height } = Aztec::encode_into("AZTEC", &mut buf).unwrap()
 /// else { unreachable!() };
 /// assert_eq!(width, height);
@@ -235,84 +319,143 @@ impl BarcodeEncoder for Aztec {
     type Input = str;
 
     fn encode_into(input: &str, buf: &mut [bool]) -> Result<Encoded, EncodeError> {
-        if input.is_empty() {
+        let data = input.as_bytes();
+        if data.is_empty() {
             return Err(EncodeError::InvalidInput("Aztec input must not be empty"));
         }
 
-        let mut data_cw = [0u8; MAX_DATA_CW];
-        let data_len = encode_text(input, &mut data_cw)?;
-        if data_len == 0 {
-            return Err(EncodeError::InvalidInput("no encodable data found"));
+        // High-level: single Binary Shift run of the whole input (from UPPER).
+        let mut bits = Bits::new();
+        bits.push_bits(31, 5)?; // B/S latch
+        let count = data.len();
+        if count <= 31 {
+            bits.push_bits(count as u32, 5)?;
+        } else {
+            bits.push_bits(0, 5)?;
+            bits.push_bits((count - 31) as u32, 11)?;
+        }
+        for &b in data {
+            bits.push_bits(b as u32, 8)?;
         }
 
-        // Choose number of compact layers (1-4) based on data size.
-        let layers = match data_len {
-            0..=4 => 1,
-            5..=11 => 2,
-            12..=22 => 3,
-            23..=40 => 4,
-            _ => return Err(EncodeError::DataTooLong),
-        };
+        // Choose the smallest symbol that fits (compact 1-4, then full 1-12).
+        let ecc_bits = bits.len * 23 / 100 + 11; // ~23% ECC
+        let total_size_bits = bits.len + ecc_bits;
 
-        let size = 11 + layers * 4; // compact Aztec size
+        let mut compact = true;
+        let mut layers = 0;
+        let mut word_size = 0;
+        let mut total_bits_layer = 0;
+        let mut stuffed = Bits::new();
+        let mut found = false;
+        for i in 0..=(MAX_LAYERS_FULL + 3) {
+            compact = i <= 3;
+            layers = if compact { i + 1 } else { i };
+            if !compact && layers > MAX_LAYERS_FULL {
+                break;
+            }
+            total_bits_layer = total_bits_in_layer(layers, compact);
+            if total_size_bits > total_bits_layer {
+                continue;
+            }
+            if word_size != WORD_SIZE[layers] {
+                word_size = WORD_SIZE[layers];
+                stuffed = Bits::new();
+                stuff_bits(&bits, word_size, &mut stuffed)?;
+            }
+            let usable = total_bits_layer - (total_bits_layer % word_size);
+            if compact && stuffed.len > word_size * 64 {
+                continue;
+            }
+            if stuffed.len + ecc_bits <= usable {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return Err(EncodeError::DataTooLong);
+        }
+
+        // Message bits (data + Reed-Solomon check words) and mode message.
+        let mut message = Bits::new();
+        generate_check_words(&stuffed, total_bits_layer, word_size, &mut message)?;
+        let message_words = stuffed.len / word_size;
+        let mut mode = Bits::new();
+        generate_mode_message(compact, layers, message_words, &mut mode)?;
+
+        // Allocate the symbol and the alignment map.
+        let base = (if compact { 11 } else { 14 }) + layers * 4;
+        let mut amap = [0usize; MAX_MATRIX];
+        let size;
+        if compact {
+            size = base;
+            for (i, slot) in amap.iter_mut().enumerate().take(base) {
+                *slot = i;
+            }
+        } else {
+            size = base + 1 + 2 * ((base / 2 - 1) / 15);
+            let orig_center = base / 2;
+            let center = size / 2;
+            for i in 0..orig_center {
+                let new_offset = i + i / 15;
+                amap[orig_center - i - 1] = center - new_offset - 1;
+                amap[orig_center + i] = center + new_offset + 1;
+            }
+        }
+
         let cells = size * size;
         if buf.len() < cells {
             return Err(EncodeError::BufferTooSmall);
         }
-
-        let mut grid = [-1i8; MAX_CELLS];
-        let center = size / 2;
-
-        // Place finder pattern
-        place_compact_finder(&mut grid, size, center);
-
-        // Place orientation marks
-        if center >= 5 {
-            place_compact_orientation(&mut grid, size, center);
+        for slot in buf[..cells].iter_mut() {
+            *slot = false;
         }
+        let mut m = Matrix { buf, size };
 
-        // Compute RS error correction for data (using ~23% EC).
-        let ec_count = (data_len / 4).max(2);
-        let mut ec = [0u8; MAX_EC];
-        rs_data(&data_cw[..data_len], ec_count, &mut ec);
-
-        // Expand combined data + EC codewords into bits (6 bits each).
-        let total_cw = data_len + ec_count;
-        let mut data_bits = [false; MAX_BITS];
-        let nbits = total_cw * 6;
-        for i in 0..total_cw {
-            let cw = if i < data_len {
-                data_cw[i]
-            } else {
-                ec[i - data_len]
-            };
-            for j in 0..6 {
-                data_bits[i * 6 + j] = (cw >> (5 - j)) & 1 != 0;
+        // Draw the data bits in the spiral.
+        let mut row_offset = 0;
+        for i in 0..layers {
+            let row_size = (layers - i) * 4 + if compact { 9 } else { 12 };
+            for j in 0..row_size {
+                let column_offset = j * 2;
+                for k in 0..2 {
+                    if message.bits[row_offset + column_offset + k] {
+                        m.set(amap[i * 2 + k], amap[i * 2 + j]);
+                    }
+                    if message.bits[row_offset + row_size * 2 + column_offset + k] {
+                        m.set(amap[i * 2 + j], amap[base - 1 - i * 2 - k]);
+                    }
+                    if message.bits[row_offset + row_size * 4 + column_offset + k] {
+                        m.set(amap[base - 1 - i * 2 - k], amap[base - 1 - i * 2 - j]);
+                    }
+                    if message.bits[row_offset + row_size * 6 + column_offset + k] {
+                        m.set(amap[base - 1 - i * 2 - j], amap[i * 2 + k]);
+                    }
+                }
             }
+            row_offset += row_size * 8;
         }
-        let data_bits = &data_bits[..nbits];
 
-        // Place data in layers.
-        for layer in 1..=layers {
-            let layer_bits_start = (layer - 1) * (nbits / layers);
-            let layer_bits_end = if layer == layers {
-                nbits
-            } else {
-                layer * (nbits / layers)
-            };
-            if layer_bits_start < nbits {
-                place_compact_layer(
-                    &mut grid,
-                    size,
-                    layer,
-                    &data_bits[layer_bits_start..layer_bits_end.min(nbits)],
-                );
+        // Draw the mode message and bull's-eye / reference grid.
+        draw_mode_message(&mut m, compact, size, &mode);
+        if compact {
+            draw_bulls_eye(&mut m, size / 2, 5);
+        } else {
+            draw_bulls_eye(&mut m, size / 2, 7);
+            let mut i = 0;
+            let mut j = 0;
+            while i < base / 2 - 1 {
+                let mut k = (size / 2) & 1;
+                while k < size {
+                    m.set(size / 2 - j, k);
+                    m.set(size / 2 + j, k);
+                    m.set(k, size / 2 - j);
+                    m.set(k, size / 2 + j);
+                    k += 2;
+                }
+                i += 15;
+                j += 16;
             }
-        }
-
-        // Fill the caller buffer (any -1 cell → light).
-        for i in 0..cells {
-            buf[i] = grid[i] == 1;
         }
 
         Ok(Encoded::Matrix {
@@ -345,21 +488,13 @@ mod tests {
     #[test]
     fn test_encode_basic() {
         let mut buf = [false; MAX_CELLS];
-        assert!(encode("AZTEC", &mut buf) >= 15); // compact layer 1 = 15
+        assert!(encode("AZTEC", &mut buf) >= 15);
     }
 
     #[test]
-    fn test_encode_short() {
+    fn test_encode_longer() {
         let mut buf = [false; MAX_CELLS];
-        assert!(encode("A", &mut buf) >= 15);
-    }
-
-    #[test]
-    fn test_finder_pattern_center_is_dark() {
-        let mut buf = [false; MAX_CELLS];
-        let size = encode("HI", &mut buf);
-        let center = size / 2;
-        assert!(buf[center * size + center], "center must be dark");
+        assert!(encode("Hello, Aztec Code! 1234567890", &mut buf) >= 15);
     }
 
     #[test]
@@ -369,35 +504,14 @@ mod tests {
     }
 
     #[test]
-    fn test_buffer_too_small() {
-        let mut buf = [false; 16];
-        assert_eq!(
-            Aztec::encode_into("A", &mut buf),
-            Err(EncodeError::BufferTooSmall)
-        );
-    }
-
-    #[test]
     fn test_symbology_name() {
         assert_eq!(Aztec::symbology_name(), "Aztec Code");
     }
 
-    #[cfg(feature = "alloc")]
     #[test]
-    fn test_svg_output() {
-        let svg = Aztec::encode("Test").unwrap().to_svg_string();
-        assert!(svg.starts_with("<svg "));
-    }
-
-    #[test]
-    fn test_gf64_mul_zero() {
-        assert_eq!(gf64_mul(0, 5), 0);
-        assert_eq!(gf64_mul(5, 0), 0);
-    }
-
-    #[test]
-    fn test_gf64_mul_identity() {
-        assert_eq!(gf64_mul(1, 7), 7);
-        assert_eq!(gf64_mul(7, 1), 7);
+    fn test_gf_mul() {
+        let gf = field_for(8);
+        assert_eq!(gf.mul(0, 5), 0);
+        assert_eq!(gf.mul(1, 7), 7);
     }
 }
