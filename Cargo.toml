@@ -1,6 +1,6 @@
 [package]
 name = "barcodes"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Universal Bar/QR codes library"
 keywords = ["barcode", "qrcode", "ean", "code128", "pdf417"]
