@@ -156,8 +156,8 @@ fn compute_check(chars: &[char]) -> Result<u8, EncodeError> {
 /// # Example
 ///
 /// ```rust
-/// use barcode::common::traits::BarcodeEncoder;
-/// use barcode::postal::rm4scc::Rm4scc;
+/// use barcodes::common::traits::BarcodeEncoder;
+/// use barcodes::postal::rm4scc::Rm4scc;
 ///
 /// let out = Rm4scc::encode("SN3 1SD").unwrap();
 /// ```

@@ -17,8 +17,8 @@ impl BarcodeOutput {
     /// # Example
     ///
     /// ```rust
-    /// use barcode::ean_upc::ean13::Ean13;
-    /// use barcode::common::traits::BarcodeEncoder;
+    /// use barcodes::ean_upc::ean13::Ean13;
+    /// use barcodes::common::traits::BarcodeEncoder;
     ///
     /// let svg = Ean13::encode("5901234123457").unwrap().to_svg_string();
     /// assert!(svg.starts_with("<svg "));

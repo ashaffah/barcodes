@@ -98,8 +98,8 @@ pub(crate) const GUARD_CENTRE: [bool; 5] = [false, true, false, true, false];
 /// # Example
 ///
 /// ```rust
-/// use barcode::common::traits::BarcodeEncoder;
-/// use barcode::ean_upc::ean13::Ean13;
+/// use barcodes::common::traits::BarcodeEncoder;
+/// use barcodes::ean_upc::ean13::Ean13;
 ///
 /// // 13 digits — check digit must be correct
 /// let out = Ean13::encode("5901234123457").unwrap();

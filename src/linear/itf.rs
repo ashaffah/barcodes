@@ -51,8 +51,8 @@ const ITF_TABLE: [[bool; 5]; 10] = [
 /// # Example
 ///
 /// ```rust
-/// use barcode::common::traits::BarcodeEncoder;
-/// use barcode::linear::itf::Itf;
+/// use barcodes::common::traits::BarcodeEncoder;
+/// use barcodes::linear::itf::Itf;
 ///
 /// let out = Itf::encode("12345678").unwrap();
 /// ```

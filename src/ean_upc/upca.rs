@@ -31,8 +31,8 @@ use crate::common::{
 /// # Example
 ///
 /// ```rust
-/// use barcode::common::traits::BarcodeEncoder;
-/// use barcode::ean_upc::upca::UpcA;
+/// use barcodes::common::traits::BarcodeEncoder;
+/// use barcodes::ean_upc::upca::UpcA;
 ///
 /// // 12 digits — check digit validated
 /// let out = UpcA::encode("012345678905").unwrap();

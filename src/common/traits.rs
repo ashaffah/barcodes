@@ -13,9 +13,9 @@ use crate::common::types::BarcodeOutput;
 /// # Example
 ///
 /// ```rust
-/// use barcode::common::traits::BarcodeEncoder;
-/// use barcode::common::types::BarcodeOutput;
-/// use barcode::ean_upc::ean13::Ean13;
+/// use barcodes::common::traits::BarcodeEncoder;
+/// use barcodes::common::types::BarcodeOutput;
+/// use barcodes::ean_upc::ean13::Ean13;
 ///
 /// let output = Ean13::encode("5901234123457").unwrap();
 /// assert!(matches!(output, BarcodeOutput::Linear(_)));

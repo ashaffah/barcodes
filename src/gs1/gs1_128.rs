@@ -66,8 +66,8 @@ fn is_fixed_length_ai(ai: &str) -> bool {
 /// # Example
 ///
 /// ```rust
-/// use barcode::common::traits::BarcodeEncoder;
-/// use barcode::gs1::gs1_128::Gs1_128;
+/// use barcodes::common::traits::BarcodeEncoder;
+/// use barcodes::gs1::gs1_128::Gs1_128;
 ///
 /// let out = Gs1_128::encode("(01)12345678901231").unwrap();
 /// ```

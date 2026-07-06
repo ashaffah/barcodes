@@ -215,8 +215,8 @@ const CODE39_TABLE: &[(char, [bool; 9])] = &[
 /// # Example
 ///
 /// ```rust
-/// use barcode::common::traits::BarcodeEncoder;
-/// use barcode::linear::code39::Code39;
+/// use barcodes::common::traits::BarcodeEncoder;
+/// use barcodes::linear::code39::Code39;
 ///
 /// let out = Code39::encode("CODE39").unwrap();
 /// ```

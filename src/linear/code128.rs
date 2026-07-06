@@ -19,8 +19,8 @@
 //! # Example
 //!
 //! ```rust
-//! use barcode::common::traits::BarcodeEncoder;
-//! use barcode::linear::code128::Code128;
+//! use barcodes::common::traits::BarcodeEncoder;
+//! use barcodes::linear::code128::Code128;
 //!
 //! let out = Code128::encode("Hello").unwrap();
 //! ```

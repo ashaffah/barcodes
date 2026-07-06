@@ -29,8 +29,8 @@ use super::ean13::{GUARD_CENTRE, GUARD_NORMAL, L_CODE, R_CODE, check_digit};
 /// # Example
 ///
 /// ```rust
-/// use barcode::common::traits::BarcodeEncoder;
-/// use barcode::ean_upc::ean8::Ean8;
+/// use barcodes::common::traits::BarcodeEncoder;
+/// use barcodes::ean_upc::ean8::Ean8;
 ///
 /// // 8 digits — check digit must be correct
 /// let out = Ean8::encode("96385074").unwrap();

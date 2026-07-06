@@ -162,8 +162,8 @@ const DATABAR_TABLE: &[[u8; 4]] = &[
 /// # Example
 ///
 /// ```rust
-/// use barcode::common::traits::BarcodeEncoder;
-/// use barcode::gs1::databar::DataBar;
+/// use barcodes::common::traits::BarcodeEncoder;
+/// use barcodes::gs1::databar::DataBar;
 ///
 /// let out = DataBar::encode("0614141123452").unwrap();
 /// ```

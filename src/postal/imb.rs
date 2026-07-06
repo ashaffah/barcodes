@@ -155,8 +155,8 @@ fn encode_imb_bars(digits: &[u8]) -> [BarState; 65] {
 /// # Example
 ///
 /// ```rust
-/// use barcode::common::traits::BarcodeEncoder;
-/// use barcode::postal::imb::Imb;
+/// use barcodes::common::traits::BarcodeEncoder;
+/// use barcodes::postal::imb::Imb;
 ///
 /// let out = Imb::encode("01234567094987654321").unwrap();
 /// ```

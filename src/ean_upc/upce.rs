@@ -69,8 +69,8 @@ const UPCE_PARITY: [[bool; 6]; 10] = [
 /// # Example
 ///
 /// ```rust
-/// use barcode::common::traits::BarcodeEncoder;
-/// use barcode::ean_upc::upce::UpcE;
+/// use barcodes::common::traits::BarcodeEncoder;
+/// use barcodes::ean_upc::upce::UpcE;
 ///
 /// // 8 digits: number system + 6 data + check digit
 /// let out = UpcE::encode("01234505").unwrap();

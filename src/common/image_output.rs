@@ -24,8 +24,8 @@ impl BarcodeOutput {
     /// # Example
     ///
     /// ```rust
-    /// use barcode::ean_upc::ean13::Ean13;
-    /// use barcode::common::traits::BarcodeEncoder;
+    /// use barcodes::ean_upc::ean13::Ean13;
+    /// use barcodes::common::traits::BarcodeEncoder;
     ///
     /// let output = Ean13::encode("5901234123457").unwrap();
     /// let img = output.to_image(2);

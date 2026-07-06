@@ -213,8 +213,8 @@ fn place_compact_layer(grid: &mut [Vec<i8>], size: usize, layer: usize, data_bit
 /// # Example
 ///
 /// ```rust
-/// use barcode::common::traits::BarcodeEncoder;
-/// use barcode::twod::aztec::Aztec;
+/// use barcodes::common::traits::BarcodeEncoder;
+/// use barcodes::twod::aztec::Aztec;
 ///
 /// let out = Aztec::encode("AZTEC").unwrap();
 /// ```

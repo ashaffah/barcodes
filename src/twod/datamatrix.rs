@@ -202,8 +202,8 @@ fn build_grid(size: usize, data_codewords: &[u8], ec_codewords: &[u8]) -> Vec<Ve
 /// # Example
 ///
 /// ```rust
-/// use barcode::common::traits::BarcodeEncoder;
-/// use barcode::twod::datamatrix::DataMatrix;
+/// use barcodes::common::traits::BarcodeEncoder;
+/// use barcodes::twod::datamatrix::DataMatrix;
 ///
 /// let out = DataMatrix::encode("Hello DM").unwrap();
 /// ```

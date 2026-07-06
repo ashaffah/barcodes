@@ -246,8 +246,8 @@ fn text_sub_value(b: u8) -> u8 {
 /// # Example
 ///
 /// ```rust
-/// use barcode::common::traits::BarcodeEncoder;
-/// use barcode::twod::pdf417::Pdf417;
+/// use barcodes::common::traits::BarcodeEncoder;
+/// use barcodes::twod::pdf417::Pdf417;
 ///
 /// let out = Pdf417::encode("Hello, PDF417!").unwrap();
 /// ```

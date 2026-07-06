@@ -32,7 +32,7 @@ use crate::common::{
 /// # Example
 ///
 /// ```rust
-/// use barcode::qrcode::{QrCode, QrCodeEcc, Version, EncodeTextOptions};
+/// use barcodes::qrcode::{QrCode, QrCodeEcc, Version, EncodeTextOptions};
 ///
 /// let mut outbuffer = vec![0u8; Version::MAX.buffer_len()];
 /// let mut tempbuffer = vec![0u8; Version::MAX.buffer_len()];
@@ -93,7 +93,7 @@ impl<'a> QrCode<'a> {
     /// # Example
     ///
     /// ```rust
-    /// use barcode::qrcode::{QrCode, QrCodeEcc, Version, EncodeTextOptions};
+    /// use barcodes::qrcode::{QrCode, QrCodeEcc, Version, EncodeTextOptions};
     ///
     /// let mut outbuffer = vec![0u8; Version::MAX.buffer_len()];
     /// let mut tempbuffer = vec![0u8; Version::MAX.buffer_len()];
@@ -400,7 +400,7 @@ impl<'a> QrCode<'a> {
     /// # Example
     ///
     /// ```rust
-    /// use barcode::qrcode::{QrCode, QrCodeEcc, Version, EncodeTextOptions};
+    /// use barcodes::qrcode::{QrCode, QrCodeEcc, Version, EncodeTextOptions};
     ///
     /// let mut outbuffer = vec![0u8; Version::MAX.buffer_len()];
     /// let mut tempbuffer = vec![0u8; Version::MAX.buffer_len()];
@@ -457,7 +457,7 @@ impl<'a> QrCode<'a> {
     /// # Example
     ///
     /// ```rust
-    /// use barcode::qrcode::{QrCode, QrCodeEcc, Version, EncodeTextOptions};
+    /// use barcodes::qrcode::{QrCode, QrCodeEcc, Version, EncodeTextOptions};
     ///
     /// let mut outbuffer = vec![0u8; Version::MAX.buffer_len()];
     /// let mut tempbuffer = vec![0u8; Version::MAX.buffer_len()];
