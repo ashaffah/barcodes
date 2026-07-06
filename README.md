@@ -6,13 +6,16 @@
 [![Rust](https://img.shields.io/badge/rust-edition_2024-orange.svg)]()
 
 A **universal bar/QR code generation library** for Rust, supporting many symbologies.  
-Zero external dependencies, `no_std` compatible (requires `alloc`).
+Zero external dependencies, pure `no_std`, and **zero heap allocation** by default.
 
 ## Features
 
+- **Zero heap allocation** by default — encoders write into a caller-provided
+  `&mut [bool]` buffer via [`encode_into`](#zero-allocation-core); pure `no_std`,
+  no `alloc` required
 - Zero external dependencies (default)
-- `no_std` compatible (requires `alloc`)
-- SVG output built-in (`to_svg_string()`)
+- Optional `alloc` feature for owned-output convenience (`encode()` +
+  `to_svg_string()`)
 - Optional image output (PNG, GIF, WebP) via `image` feature
 - Supports 16+ barcode symbologies: linear, 2D, and postal
 
@@ -20,19 +23,56 @@ Zero external dependencies, `no_std` compatible (requires `alloc`).
 
 Add `barcodes` to your `Cargo.toml`.
 
-**Default (no_std, SVG only):**
+**Default (pure `no_std`, zero allocation):**
 
 ```toml
 [dependencies]
-barcodes = "0.1"
+barcodes = "0.2"
 ```
 
-**With image output (PNG/GIF/WebP):**
+**With owned output + SVG string convenience (`alloc`):**
 
 ```toml
 [dependencies]
-barcodes = { version = "0.1", features = ["image"] }
+barcodes = { version = "0.2", features = ["alloc"] }
 ```
+
+**With image output (PNG/GIF/WebP — implies `std`):**
+
+```toml
+[dependencies]
+barcodes = { version = "0.2", features = ["image"] }
+```
+
+## Zero-allocation core
+
+Every encoder implements
+[`BarcodeEncoder::encode_into`](https://docs.rs/barcodes/latest/barcodes/common/traits/trait.BarcodeEncoder.html),
+which writes the symbol's modules into a caller-provided buffer and returns an
+`Encoded` describing the written region — no heap, no `alloc`:
+
+```rust
+use barcodes::common::traits::BarcodeEncoder;
+use barcodes::common::types::Encoded;
+use barcodes::ean_upc::ean13::Ean13;
+
+let mut buf = [false; 128]; // stack buffer, one bool per module
+let Encoded::Linear { len, height } = Ean13::encode_into("5901234123457", &mut buf).unwrap()
+else { unreachable!() };
+
+let bars = &buf[..len]; // true = dark module, false = light
+assert_eq!(bars.len(), 95);
+let _ = height;
+```
+
+2D symbologies return `Encoded::Matrix { width, height }`; their modules fill
+`buf[..width * height]` in row-major order.
+
+Render to SVG without allocating via [`common::svg`](https://docs.rs/barcodes/latest/barcodes/common/svg/index.html),
+which streams into any `core::fmt::Write` sink.
+
+> The `alloc` feature adds the convenience `Encoder::encode()` (returning an
+> owned `BarcodeOutput`) and `.to_svg_string()`. The examples below use it.
 
 ## Supported symbologies
 
@@ -299,11 +339,18 @@ let img = qr.to_image(4); // module_size = 4px
 img.save("qrcode.png").unwrap();
 ```
 
-## `no_std` Support
+## `no_std` and features
 
-This library is `no_std` compatible by default and only requires the `alloc` crate.  
-Enable the `std` feature if you need standard library support.  
-Image output (`to_image()`) requires the `image` feature, which implies `std`.
+This library is pure `no_std` by default and performs **no heap allocation** —
+the default build does not even link `alloc`, so any accidental allocation is a
+compile error.
+
+| Feature     | Adds                                                  | Implies |
+| ----------- | ----------------------------------------------------- | ------- |
+| _(default)_ | zero-alloc `encode_into` + `core::fmt::Write` SVG     | —       |
+| `alloc`     | owned `encode()` → `BarcodeOutput`, `to_svg_string()` | —       |
+| `std`       | `std::error::Error` for `EncodeError`                 | `alloc` |
+| `image`     | raster output `to_image()` (PNG/GIF/WebP)             | `std`   |
 
 ## Modules Overview
 
