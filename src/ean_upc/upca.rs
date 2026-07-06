@@ -143,6 +143,15 @@ mod tests {
     }
 
     #[test]
+    fn test_check_digit_odd_length_weighting() {
+        // Regression: the shared check-digit routine must weight from the right
+        // (rightmost data digit ×3) so 11-digit UPC-A codes are correct.
+        // 03600029145 -> check 2 (well-known "036000291452").
+        let digits: [u8; 11] = [0, 3, 6, 0, 0, 0, 2, 9, 1, 4, 5];
+        assert_eq!(check_digit(&digits), 2);
+    }
+
+    #[test]
     fn test_encode_12_digits() {
         let out = UpcA::encode("012345678905").unwrap();
         match out {

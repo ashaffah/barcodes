@@ -167,13 +167,18 @@ fn parse_and_validate(input: &str) -> Result<[u8; 13], EncodeError> {
     }
 }
 
-/// Compute EAN-13 / EAN-8 check digit from a slice of digit values (without check).
+/// Compute EAN-13 / EAN-8 / UPC check digit from a slice of digit values (without check).
 pub(crate) fn check_digit(digits: &[u8]) -> u8 {
+    // GS1 weighting is defined from the right: the rightmost data digit has
+    // weight 3, then 1, alternating. Weighting from the right (rather than the
+    // left) keeps this correct for any data length — EAN-13 (12 digits), EAN-8
+    // (7), and UPC-A/UPC-E (11) all share this routine.
     let sum: u32 = digits
         .iter()
+        .rev()
         .enumerate()
         .map(|(i, &d)| {
-            let weight = if i % 2 == 0 { 1u32 } else { 3u32 };
+            let weight = if i % 2 == 0 { 3u32 } else { 1u32 };
             weight * d as u32
         })
         .sum();
