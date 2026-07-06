@@ -74,6 +74,11 @@ which streams into any `core::fmt::Write` sink.
 > The `alloc` feature adds the convenience `Encoder::encode()` (returning an
 > owned `BarcodeOutput`) and `.to_svg_string()`. The examples below use it.
 
+> **Upgrading from 0.1.x?** `encode()` / `to_svg_string()` now live behind the
+> `alloc` feature. Enable `features = ["alloc"]` to keep the old code unchanged,
+> or switch to the zero-allocation `encode_into` shown above. See
+> [CHANGELOG.md](CHANGELOG.md#migration-from-01x).
+
 ## Supported symbologies
 
 | Symbology                   | Module                       | Status |
