@@ -214,7 +214,7 @@ impl BarcodeEncoder for Rm4scc {
 
         // Check digit bar: the combined index (0-35) reduced to a 4-state bar
         // value (mod 4, minimum 1 to ensure at least an ascender bar)
-        let check_state = (check_val % 4) as u8;
+        let check_state = check_val % 4;
         states.push(check_state.max(1)); // at least ascender
 
         // Stop bar
