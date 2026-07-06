@@ -120,76 +120,203 @@ fn ascii_encode(input: &[u8]) -> Vec<u8> {
     codewords
 }
 
-// ---- Main encoder ----------------------------------------------------------
+// ---- ISO/IEC 16022 ECC 200 symbol-character placement ----------------------
+//
+// These functions reproduce the standard placement algorithm (ISO/IEC 16022
+// Annex F). Each mapping-matrix cell is tagged with which codeword bit it
+// carries so the symbol decodes on a conforming reader.
 
-/// Build a Data Matrix grid with finder pattern and data.
+/// Tag mapping cell (r, c) with bit `b` (7 = MSB) of 1-based codeword `p`,
+/// wrapping negative coordinates per the spec.
+fn place_bit(a: &mut [u16], nr: isize, nc: isize, mut r: isize, mut c: isize, p: usize, b: u16) {
+    if r < 0 {
+        r += nr;
+        c += 4 - ((nr + 4) % 8);
+    }
+    if c < 0 {
+        c += nc;
+        r += 4 - ((nc + 4) % 8);
+    }
+    a[(r * nc + c) as usize] = ((p as u16) << 3) | b;
+}
+
+/// Place the 8 modules of the standard "utah" shape for codeword `p`.
+fn place_block(a: &mut [u16], nr: isize, nc: isize, r: isize, c: isize, p: usize) {
+    place_bit(a, nr, nc, r - 2, c - 2, p, 7);
+    place_bit(a, nr, nc, r - 2, c - 1, p, 6);
+    place_bit(a, nr, nc, r - 1, c - 2, p, 5);
+    place_bit(a, nr, nc, r - 1, c - 1, p, 4);
+    place_bit(a, nr, nc, r - 1, c, p, 3);
+    place_bit(a, nr, nc, r, c - 2, p, 2);
+    place_bit(a, nr, nc, r, c - 1, p, 1);
+    place_bit(a, nr, nc, r, c, p, 0);
+}
+
+fn corner_a(a: &mut [u16], nr: isize, nc: isize, p: usize) {
+    place_bit(a, nr, nc, nr - 1, 0, p, 7);
+    place_bit(a, nr, nc, nr - 1, 1, p, 6);
+    place_bit(a, nr, nc, nr - 1, 2, p, 5);
+    place_bit(a, nr, nc, 0, nc - 2, p, 4);
+    place_bit(a, nr, nc, 0, nc - 1, p, 3);
+    place_bit(a, nr, nc, 1, nc - 1, p, 2);
+    place_bit(a, nr, nc, 2, nc - 1, p, 1);
+    place_bit(a, nr, nc, 3, nc - 1, p, 0);
+}
+
+fn corner_b(a: &mut [u16], nr: isize, nc: isize, p: usize) {
+    place_bit(a, nr, nc, nr - 3, 0, p, 7);
+    place_bit(a, nr, nc, nr - 2, 0, p, 6);
+    place_bit(a, nr, nc, nr - 1, 0, p, 5);
+    place_bit(a, nr, nc, 0, nc - 4, p, 4);
+    place_bit(a, nr, nc, 0, nc - 3, p, 3);
+    place_bit(a, nr, nc, 0, nc - 2, p, 2);
+    place_bit(a, nr, nc, 0, nc - 1, p, 1);
+    place_bit(a, nr, nc, 1, nc - 1, p, 0);
+}
+
+fn corner_c(a: &mut [u16], nr: isize, nc: isize, p: usize) {
+    place_bit(a, nr, nc, nr - 3, 0, p, 7);
+    place_bit(a, nr, nc, nr - 2, 0, p, 6);
+    place_bit(a, nr, nc, nr - 1, 0, p, 5);
+    place_bit(a, nr, nc, 0, nc - 2, p, 4);
+    place_bit(a, nr, nc, 0, nc - 1, p, 3);
+    place_bit(a, nr, nc, 1, nc - 1, p, 2);
+    place_bit(a, nr, nc, 2, nc - 1, p, 1);
+    place_bit(a, nr, nc, 3, nc - 1, p, 0);
+}
+
+fn corner_d(a: &mut [u16], nr: isize, nc: isize, p: usize) {
+    place_bit(a, nr, nc, nr - 1, 0, p, 7);
+    place_bit(a, nr, nc, nr - 1, nc - 1, p, 6);
+    place_bit(a, nr, nc, 0, nc - 3, p, 5);
+    place_bit(a, nr, nc, 0, nc - 2, p, 4);
+    place_bit(a, nr, nc, 0, nc - 1, p, 3);
+    place_bit(a, nr, nc, 1, nc - 3, p, 2);
+    place_bit(a, nr, nc, 1, nc - 2, p, 1);
+    place_bit(a, nr, nc, 1, nc - 1, p, 0);
+}
+
+/// Compute the ECC 200 placement map for an `nr × nc` mapping matrix.
+///
+/// Each entry is `0` (unused → light), `1` (fixed dark corner module), or
+/// `(codeword_1based << 3) | bit` with bit 7 = MSB.
+fn ecc200_placement(nr: usize, nc: usize) -> Vec<u16> {
+    let mut a = vec![0u16; nr * nc];
+    let (nri, nci) = (nr as isize, nc as isize);
+    let idx = |r: isize, c: isize| (r * nci + c) as usize;
+
+    let mut p = 1usize;
+    let mut r: isize = 4;
+    let mut c: isize = 0;
+
+    loop {
+        // Corner conditions.
+        if r == nri && c == 0 {
+            corner_a(&mut a, nri, nci, p);
+            p += 1;
+        }
+        if r == nri - 2 && c == 0 && (nci % 4) != 0 {
+            corner_b(&mut a, nri, nci, p);
+            p += 1;
+        }
+        if r == nri - 2 && c == 0 && (nci % 8) == 4 {
+            corner_c(&mut a, nri, nci, p);
+            p += 1;
+        }
+        if r == nri + 4 && c == 2 && (nci % 8) == 0 {
+            corner_d(&mut a, nri, nci, p);
+            p += 1;
+        }
+
+        // Sweep diagonally up and to the right.
+        loop {
+            if r < nri && c >= 0 && a[idx(r, c)] == 0 {
+                place_block(&mut a, nri, nci, r, c, p);
+                p += 1;
+            }
+            r -= 2;
+            c += 2;
+            if !(r >= 0 && c < nci) {
+                break;
+            }
+        }
+        r += 1;
+        c += 3;
+
+        // Sweep diagonally down and to the left.
+        loop {
+            if r >= 0 && c < nci && a[idx(r, c)] == 0 {
+                place_block(&mut a, nri, nci, r, c, p);
+                p += 1;
+            }
+            r += 2;
+            c -= 2;
+            if !(r < nri && c >= 0) {
+                break;
+            }
+        }
+        r += 3;
+        c += 1;
+
+        if !(r < nri || c < nci) {
+            break;
+        }
+    }
+
+    // Fixed pattern for the unfilled bottom-right corner (small even sizes).
+    let last = nr * nc - 1;
+    if a[last] == 0 {
+        a[last] = 1;
+        a[nr * nc - nc - 2] = 1;
+    }
+    a
+}
+
+/// Build a Data Matrix grid with the standard finder/timing pattern and ECC 200
+/// data placement.
 fn build_grid(size: usize, data_codewords: &[u8], ec_codewords: &[u8]) -> Vec<Vec<bool>> {
-    // Initialize grid: -1 = unplaced, 0 = light, 1 = dark
-    let mut grid: Vec<Vec<i16>> = vec![vec![-1i16; size]; size];
+    let mut grid: Vec<Vec<bool>> = vec![vec![false; size]; size];
 
-    // Place finder pattern (L-shape: solid dark on bottom row and left column)
+    // Finder pattern: solid L on the left column and bottom row.
     #[allow(clippy::needless_range_loop)]
-    for c in 0..size {
-        grid[size - 1][c] = 1; // bottom row (all dark)
-        grid[0][c] = if c % 2 == 0 { 1 } else { 0 }; // top row (alternating, starts dark)
+    for i in 0..size {
+        grid[size - 1][i] = true; // bottom solid
+        grid[i][0] = true; // left solid
     }
-    #[allow(clippy::needless_range_loop)]
-    for r in 0..size {
-        grid[r][0] = 1; // left column (all dark)
-        grid[r][size - 1] = if r % 2 == 0 { 0 } else { 1 }; // right column (alternating, starts light)
+    // Timing pattern: top row dark on even columns, right column dark on odd
+    // rows (so both tracks meet the solid L correctly).
+    for i in (0..size).step_by(2) {
+        grid[0][i] = true; // top timing: even columns
+    }
+    for i in (1..size).step_by(2) {
+        grid[i][size - 1] = true; // right timing: odd rows
     }
 
-    // Combine data and EC codewords
+    // Combine data + EC codewords in placement order.
     let mut all_cw: Vec<u8> = Vec::with_capacity(data_codewords.len() + ec_codewords.len());
     all_cw.extend_from_slice(data_codewords);
     all_cw.extend_from_slice(ec_codewords);
 
-    // Place data using diagonal algorithm (simplified)
-    let inner_size = size - 2; // exclude border
-    let mut cw_idx = 0usize;
-    let mut bit_pos = 0usize;
-
-    // Simple row-by-row placement within the data region
-    'outer: for col_start in (1..inner_size + 1).step_by(2).rev() {
-        let going_up = (inner_size - col_start) % 4 < 2;
-        let row_range: Vec<usize> = if going_up {
-            (1..inner_size + 1).rev().collect()
-        } else {
-            (1..inner_size + 1).collect()
-        };
-
-        for row in row_range {
-            for dc in 0..2usize {
-                let c = col_start + dc;
-                if c > inner_size {
-                    continue;
+    // Standard ECC 200 placement into the (size-2) × (size-2) data region.
+    let nr = size - 2;
+    let nc = size - 2;
+    let places = ecc200_placement(nr, nc);
+    for mr in 0..nr {
+        for mc in 0..nc {
+            let v = places[mr * nc + mc];
+            let dark = match v {
+                0 => false,
+                1 => true,
+                _ => {
+                    let cw = all_cw[(v >> 3) as usize - 1];
+                    (cw >> (v & 7)) & 1 == 1
                 }
-                if grid[row][c] >= 0 {
-                    continue; // already placed (finder/timing)
-                }
-
-                let cw = if cw_idx < all_cw.len() {
-                    all_cw[cw_idx]
-                } else {
-                    0
-                };
-                let bit = 7 - (bit_pos % 8);
-                grid[row][c] = ((cw >> bit) & 1) as i16;
-                bit_pos += 1;
-                if bit_pos.is_multiple_of(8) {
-                    cw_idx += 1;
-                    if cw_idx >= all_cw.len() {
-                        break 'outer;
-                    }
-                }
-            }
+            };
+            grid[mr + 1][mc + 1] = dark;
         }
     }
 
-    // Convert to bool grid (any -1 treated as light)
-    grid.into_iter()
-        .map(|row| row.into_iter().map(|v| v == 1).collect())
-        .collect()
+    grid
 }
 
 // ---- Public encoder --------------------------------------------------------
@@ -330,5 +457,109 @@ mod tests {
         assert_eq!(gf256_mul(0, 1), 0);
         assert_eq!(gf256_mul(1, 1), 1);
         assert_eq!(gf256_mul(2, 2), 4);
+    }
+
+    /// Canonical ISO/IEC 16022 worked example: ASCII-encoding "123456" gives
+    /// data codewords [142, 164, 186]; ECC 200 appends [114, 25, 5, 88, 102].
+    #[test]
+    fn test_rs_iso_reference_vector() {
+        let data = ascii_encode(b"123456");
+        assert_eq!(data, vec![142, 164, 186]);
+        let ec = rs_encode_dm(&data, 5);
+        assert_eq!(ec, vec![114, 25, 5, 88, 102]);
+    }
+
+    /// Recover the codeword stream from a rendered symbol by inverting the
+    /// standard placement — verifies finder/timing offset and bit placement.
+    fn recover_codewords(mb: &MatrixBarcode) -> Vec<u8> {
+        let size = mb.width;
+        let nr = size - 2;
+        let nc = size - 2;
+        let places = ecc200_placement(nr, nc);
+        let capacity = nr * nc / 8;
+        let mut cw = vec![0u8; capacity];
+        for mr in 0..nr {
+            for mc in 0..nc {
+                let v = places[mr * nc + mc];
+                if v > 1 && mb.modules[mr + 1][mc + 1] {
+                    cw[(v >> 3) as usize - 1] |= 1 << (v & 7);
+                }
+            }
+        }
+        cw
+    }
+
+    /// Decode ECC 200 ASCII-mode data codewords back to the original bytes.
+    fn decode_ascii(cw: &[u8]) -> alloc::string::String {
+        let mut s = alloc::string::String::new();
+        for &c in cw {
+            match c {
+                129 => break, // pad → end of data
+                1..=128 => s.push((c - 1) as char),
+                130..=229 => {
+                    let v = c - 130;
+                    s.push((b'0' + v / 10) as char);
+                    s.push((b'0' + v % 10) as char);
+                }
+                _ => {}
+            }
+        }
+        s
+    }
+
+    /// Round-trip: encode → invert placement → check RS syndrome → decode ASCII.
+    /// Proves the placement is self-consistent and RS-valid for every size.
+    #[test]
+    fn test_round_trip_all_sizes() {
+        let inputs = [
+            "A",
+            "Hi",
+            "12345",
+            "HELLO WORLD",
+            "f3411c82-1c70-4207-977e-99f5580e7e3b",
+            "The quick brown fox jumps over the lazy do", // 42 chars → 26×26
+        ];
+        for input in inputs {
+            let mb = match DataMatrix::encode(input).unwrap() {
+                BarcodeOutput::Matrix(mb) => mb,
+                _ => panic!("expected matrix"),
+            };
+            let size = mb.width;
+            let params = SYMBOL_PARAMS.iter().find(|p| p.0 == size).unwrap();
+            let (_, _, _, data_per_block, ec_per_block) = *params;
+
+            let all_cw = recover_codewords(&mb);
+            let (data, ec) = all_cw.split_at(data_per_block);
+
+            // Reed-Solomon must be consistent with the recovered data.
+            assert_eq!(
+                rs_encode_dm(data, ec_per_block),
+                ec,
+                "RS mismatch for {input:?} ({size}x{size})"
+            );
+
+            // ASCII payload must decode back to the original input.
+            let decoded = decode_ascii(data);
+            assert_eq!(decoded, input, "round-trip mismatch ({size}x{size})");
+        }
+    }
+
+    /// The four corner modules must match the standard finder/timing pattern.
+    #[test]
+    fn test_finder_timing_corners() {
+        let mb = match DataMatrix::encode("Hi").unwrap() {
+            BarcodeOutput::Matrix(mb) => mb,
+            _ => panic!(),
+        };
+        let n = mb.width - 1;
+        assert!(mb.modules[0][0], "top-left dark");
+        assert!(mb.modules[n][0], "bottom-left dark");
+        assert!(mb.modules[n][n], "bottom-right dark");
+        // Top timing: dark at even columns, light at odd.
+        assert!(mb.modules[0][2], "top timing even col dark");
+        assert!(!mb.modules[0][1], "top timing odd col light");
+        // Right timing: dark at odd rows, light at even.
+        assert!(mb.modules[1][n], "right timing odd row dark");
+        assert!(!mb.modules[0][n], "right timing even row light");
     }
 }
