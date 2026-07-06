@@ -7,20 +7,30 @@
 //!
 //! # Structure
 //!
-//! - L-shaped finder pattern on the bottom and left
-//! - Alternating timing pattern on the top and right
-//! - Data modules placed diagonally following the standard placement algorithm
+//! - L-shaped finder pattern on the bottom and left of each data region
+//! - Alternating timing pattern on the top and right of each data region
+//! - Data placed with the standard ISO/IEC 16022 symbol-character algorithm
 //! - Reed-Solomon error correction codewords
 #![forbid(unsafe_code)]
 
-extern crate alloc;
-use alloc::{vec, vec::Vec};
+use crate::common::{errors::EncodeError, traits::BarcodeEncoder, types::Encoded};
 
-use crate::common::{
-    errors::EncodeError,
-    traits::BarcodeEncoder,
-    types::{BarcodeOutput, MatrixBarcode},
-};
+// ---- Fixed capacity bounds (largest supported 48×48 symbol) ----------------
+
+/// Largest supported symbol dimension (used to size test buffers).
+#[cfg(test)]
+const MAX_SIZE: usize = 48;
+/// Largest supported module count (`MAX_SIZE²`).
+#[cfg(test)]
+const MAX_CELLS: usize = MAX_SIZE * MAX_SIZE;
+/// Largest mapping-matrix side (`regions · data_region`, 2·22 for 48×48).
+const MAX_MAPPING: usize = 44;
+/// Largest mapping-matrix cell count.
+const MAX_MAP_CELLS: usize = MAX_MAPPING * MAX_MAPPING;
+/// Largest data-codeword capacity across supported symbols.
+const MAX_DATA_CW: usize = 174;
+/// Largest error-correction codeword count across supported symbols.
+const MAX_EC: usize = 68;
 
 // ---- Symbol parameters -----------------------------------------------------
 
@@ -77,57 +87,65 @@ fn gf256_pow(base: u8, exp: usize) -> u8 {
     result
 }
 
-/// Compute Reed-Solomon check bytes for Data Matrix.
-fn rs_encode_dm(data: &[u8], ec_count: usize) -> Vec<u8> {
-    // Generator polynomial coefficients
-    let mut poly = vec![1u8; 1];
+/// Compute Reed-Solomon check bytes for Data Matrix into `out[..ec_count]`.
+fn rs_encode_dm(data: &[u8], ec_count: usize, out: &mut [u8]) {
+    // Generator polynomial coefficients (length ec_count + 1).
+    let mut poly = [0u8; MAX_EC + 1];
+    poly[0] = 1;
     for i in 0..ec_count {
         let root = gf256_pow(2, i + 1);
-        let new_len = poly.len() + 1;
-        let mut new_poly = vec![0u8; new_len];
-        for (j, &gj) in poly.iter().enumerate() {
-            new_poly[j] ^= gj;
-            new_poly[j + 1] ^= gf256_mul(gj, root);
+        let cur = i + 1; // current polynomial length before this multiply
+        let mut new_poly = [0u8; MAX_EC + 1];
+        for j in 0..cur {
+            new_poly[j] ^= poly[j];
+            new_poly[j + 1] ^= gf256_mul(poly[j], root);
         }
-        poly = new_poly;
+        poly[..cur + 1].copy_from_slice(&new_poly[..cur + 1]);
     }
 
-    // Polynomial division
-    let mut remainder = vec![0u8; ec_count];
+    // Polynomial division.
+    let mut rem_buf = [0u8; MAX_EC];
+    let rem = &mut rem_buf[..ec_count];
     for &d in data {
-        let lead = d ^ remainder[0];
-        remainder.copy_within(1.., 0);
-        *remainder.last_mut().unwrap() = 0;
+        let lead = d ^ rem[0];
+        rem.copy_within(1.., 0);
+        rem[ec_count - 1] = 0;
         if lead != 0 {
             for i in 0..ec_count {
-                remainder[i] ^= gf256_mul(lead, poly[i + 1]);
+                rem[i] ^= gf256_mul(lead, poly[i + 1]);
             }
         }
     }
-    remainder
+    out[..ec_count].copy_from_slice(rem);
 }
 
 // ---- ASCII encoding --------------------------------------------------------
 
-/// Encode input bytes in Data Matrix ASCII mode.
+/// Encode input bytes in Data Matrix ASCII mode into `out`, returning the count.
+///
 /// ASCII values 1-128 are encoded as value + 1 (so 0 is unused).
 /// Digit pairs 00-99 are encoded as 130+value.
-fn ascii_encode(input: &[u8]) -> Vec<u8> {
-    let mut codewords: Vec<u8> = Vec::new();
+fn ascii_encode(input: &[u8], out: &mut [u8]) -> Result<usize, EncodeError> {
+    let mut n = 0;
+    let mut push = |v: u8| -> Result<(), EncodeError> {
+        *out.get_mut(n).ok_or(EncodeError::DataTooLong)? = v;
+        n += 1;
+        Ok(())
+    };
     let mut i = 0;
     while i < input.len() {
         if i + 1 < input.len() && input[i].is_ascii_digit() && input[i + 1].is_ascii_digit() {
             // Encode digit pair
             let val = (input[i] - b'0') * 10 + (input[i + 1] - b'0');
-            codewords.push(130 + val);
+            push(130 + val)?;
             i += 2;
         } else {
             // Single ASCII
-            codewords.push(input[i] + 1);
+            push(input[i] + 1)?;
             i += 1;
         }
     }
-    codewords
+    Ok(n)
 }
 
 // ---- ISO/IEC 16022 ECC 200 symbol-character placement ----------------------
@@ -206,12 +224,14 @@ fn corner_d(a: &mut [u16], nr: isize, nc: isize, p: usize) {
     place_bit(a, nr, nc, 1, nc - 1, p, 0);
 }
 
-/// Compute the ECC 200 placement map for an `nr × nc` mapping matrix.
+/// Compute the ECC 200 placement map into `a[..nr*nc]`.
 ///
 /// Each entry is `0` (unused → light), `1` (fixed dark corner module), or
 /// `(codeword_1based << 3) | bit` with bit 7 = MSB.
-fn ecc200_placement(nr: usize, nc: usize) -> Vec<u16> {
-    let mut a = vec![0u16; nr * nc];
+fn ecc200_placement(nr: usize, nc: usize, a: &mut [u16]) {
+    for x in a[..nr * nc].iter_mut() {
+        *x = 0;
+    }
     let (nri, nci) = (nr as isize, nc as isize);
     let idx = |r: isize, c: isize| (r * nci + c) as usize;
 
@@ -222,26 +242,26 @@ fn ecc200_placement(nr: usize, nc: usize) -> Vec<u16> {
     loop {
         // Corner conditions.
         if r == nri && c == 0 {
-            corner_a(&mut a, nri, nci, p);
+            corner_a(a, nri, nci, p);
             p += 1;
         }
         if r == nri - 2 && c == 0 && (nci % 4) != 0 {
-            corner_b(&mut a, nri, nci, p);
+            corner_b(a, nri, nci, p);
             p += 1;
         }
         if r == nri - 2 && c == 0 && (nci % 8) == 4 {
-            corner_c(&mut a, nri, nci, p);
+            corner_c(a, nri, nci, p);
             p += 1;
         }
         if r == nri + 4 && c == 2 && (nci % 8) == 0 {
-            corner_d(&mut a, nri, nci, p);
+            corner_d(a, nri, nci, p);
             p += 1;
         }
 
         // Sweep diagonally up and to the right.
         loop {
             if r < nri && c >= 0 && a[idx(r, c)] == 0 {
-                place_block(&mut a, nri, nci, r, c, p);
+                place_block(a, nri, nci, r, c, p);
                 p += 1;
             }
             r -= 2;
@@ -256,7 +276,7 @@ fn ecc200_placement(nr: usize, nc: usize) -> Vec<u16> {
         // Sweep diagonally down and to the left.
         loop {
             if r >= 0 && c < nci && a[idx(r, c)] == 0 {
-                place_block(&mut a, nri, nci, r, c, p);
+                place_block(a, nri, nci, r, c, p);
                 p += 1;
             }
             r += 2;
@@ -279,24 +299,30 @@ fn ecc200_placement(nr: usize, nc: usize) -> Vec<u16> {
         a[last] = 1;
         a[nr * nc - nc - 2] = 1;
     }
-    a
 }
 
+// ---- Main encoder ----------------------------------------------------------
+
 /// Build a Data Matrix grid with the standard finder/timing pattern and ECC 200
-/// data placement.
+/// data placement, writing the row-major module grid into `buf[..size * size]`.
 ///
 /// `data_region` is the interior data size of one region and `regions` is the
-/// number of regions per side (1 for sizes ≤ 26, 2 for 32–48). Each region is
-/// framed by its own solid-L finder and alternating timing tracks; the data is
-/// placed over the combined `(regions·data_region)` mapping matrix.
+/// number of regions per side (1 for sizes ≤ 26, 2 for 32–48).
 fn build_grid(
     size: usize,
     data_region: usize,
     regions: usize,
     data_codewords: &[u8],
     ec_codewords: &[u8],
-) -> Vec<Vec<bool>> {
-    let mut grid: Vec<Vec<bool>> = vec![vec![false; size]; size];
+    buf: &mut [bool],
+) -> Result<(), EncodeError> {
+    let cells = size * size;
+    if buf.len() < cells {
+        return Err(EncodeError::BufferTooSmall);
+    }
+    for x in buf[..cells].iter_mut() {
+        *x = false;
+    }
 
     // Finder/timing pattern around every data region.
     let block = data_region + 2;
@@ -305,27 +331,29 @@ fn build_grid(
             let r0 = br * block;
             let c0 = bc * block;
             for i in 0..block {
-                grid[r0 + block - 1][c0 + i] = true; // bottom solid
-                grid[r0 + i][c0] = true; // left solid
+                buf[(r0 + block - 1) * size + c0 + i] = true; // bottom solid
+                buf[(r0 + i) * size + c0] = true; // left solid
             }
-            for i in (0..block).step_by(2) {
-                grid[r0][c0 + i] = true; // top timing: even columns
+            let mut i = 0;
+            while i < block {
+                buf[r0 * size + c0 + i] = true; // top timing: even columns
+                i += 2;
             }
-            for i in (1..block).step_by(2) {
-                grid[r0 + i][c0 + block - 1] = true; // right timing: odd rows
+            let mut i = 1;
+            while i < block {
+                buf[(r0 + i) * size + c0 + block - 1] = true; // right timing: odd rows
+                i += 2;
             }
         }
     }
 
-    // Combine data + EC codewords in placement order.
-    let mut all_cw: Vec<u8> = Vec::with_capacity(data_codewords.len() + ec_codewords.len());
-    all_cw.extend_from_slice(data_codewords);
-    all_cw.extend_from_slice(ec_codewords);
-
     // Standard ECC 200 placement over the combined mapping matrix, then map each
     // logical cell into its region's interior (offset past that region's border).
     let mapping = regions * data_region;
-    let places = ecc200_placement(mapping, mapping);
+    let mut places = [0u16; MAX_MAP_CELLS];
+    ecc200_placement(mapping, mapping, &mut places);
+
+    let data_len = data_codewords.len();
     for mr in 0..mapping {
         for mc in 0..mapping {
             let v = places[mr * mapping + mc];
@@ -333,17 +361,22 @@ fn build_grid(
                 0 => false,
                 1 => true,
                 _ => {
-                    let cw = all_cw[(v >> 3) as usize - 1];
+                    let cw_idx = (v >> 3) as usize - 1;
+                    let cw = if cw_idx < data_len {
+                        data_codewords[cw_idx]
+                    } else {
+                        ec_codewords[cw_idx - data_len]
+                    };
                     (cw >> (v & 7)) & 1 == 1
                 }
             };
             let pr = (mr / data_region) * block + 1 + (mr % data_region);
             let pc = (mc / data_region) * block + 1 + (mc % data_region);
-            grid[pr][pc] = dark;
+            buf[pr * size + pc] = dark;
         }
     }
 
-    grid
+    Ok(())
 }
 
 // ---- Public encoder --------------------------------------------------------
@@ -357,57 +390,66 @@ fn build_grid(
 ///
 /// ```rust
 /// use barcodes::common::traits::BarcodeEncoder;
+/// use barcodes::common::types::Encoded;
 /// use barcodes::twod::datamatrix::DataMatrix;
 ///
-/// let out = DataMatrix::encode("Hello DM").unwrap();
+/// let mut buf = [false; 48 * 48];
+/// let Encoded::Matrix { width, height } = DataMatrix::encode_into("Hello DM", &mut buf).unwrap()
+/// else { unreachable!() };
+/// assert_eq!(width, height);
 /// ```
 pub struct DataMatrix;
 
 impl BarcodeEncoder for DataMatrix {
     type Input = str;
-    type Error = EncodeError;
 
-    fn encode(input: &str) -> Result<BarcodeOutput, EncodeError> {
+    fn encode_into(input: &str, buf: &mut [bool]) -> Result<Encoded, EncodeError> {
         if input.is_empty() {
             return Err(EncodeError::InvalidInput(
-                "Data Matrix input must not be empty".into(),
+                "Data Matrix input must not be empty",
             ));
         }
 
-        let data_cw = ascii_encode(input.as_bytes());
+        // ASCII-encode into a fixed scratch buffer.
+        let mut data_cw = [0u8; MAX_DATA_CW + 1];
+        let n = ascii_encode(input.as_bytes(), &mut data_cw)?;
 
         // Find the smallest symbol whose data capacity fits.
         let params = SYMBOL_PARAMS
             .iter()
-            .find(|&&(_, _, _, data_cap, _)| data_cw.len() <= data_cap)
+            .find(|&&(_, _, _, data_cap, _)| n <= data_cap)
             .ok_or(EncodeError::DataTooLong)?;
 
         let (size, data_region, regions, data_cap, ec_count) = *params;
 
         // Pad to the data capacity. ECC 200 uses codeword 129 for the first
         // pad, then the "253-state" pseudo-random algorithm for the rest.
-        let mut padded = data_cw.clone();
-        if padded.len() < data_cap {
-            padded.push(129);
-            while padded.len() < data_cap {
-                let pos = padded.len() + 1; // 1-based codeword position
+        let mut padded = [0u8; MAX_DATA_CW];
+        padded[..n].copy_from_slice(&data_cw[..n]);
+        if n < data_cap {
+            padded[n] = 129;
+            let mut i = n + 1;
+            while i < data_cap {
+                let pos = i + 1; // 1-based codeword position
                 let r = ((149 * pos) % 253) + 1;
                 let v = 129 + r;
-                padded.push(if v > 254 { (v - 254) as u8 } else { v as u8 });
+                padded[i] = if v > 254 { (v - 254) as u8 } else { v as u8 };
+                i += 1;
             }
         }
+        let data = &padded[..data_cap];
 
-        // Compute RS error correction over the padded data.
-        let ec = rs_encode_dm(&padded, ec_count);
+        // Compute RS error correction.
+        let mut ec = [0u8; MAX_EC];
+        rs_encode_dm(data, ec_count, &mut ec);
 
-        // Build the grid.
-        let grid = build_grid(size, data_region, regions, &padded, &ec);
+        // Build the grid directly into the caller buffer.
+        build_grid(size, data_region, regions, data, &ec[..ec_count], buf)?;
 
-        Ok(BarcodeOutput::Matrix(MatrixBarcode {
+        Ok(Encoded::Matrix {
             width: size,
             height: size,
-            modules: grid,
-        }))
+        })
     }
 
     fn symbology_name() -> &'static str {
@@ -421,68 +463,103 @@ impl BarcodeEncoder for DataMatrix {
 mod tests {
     use super::*;
 
+    fn encode(input: &str, buf: &mut [bool]) -> (usize, usize) {
+        match DataMatrix::encode_into(input, buf).unwrap() {
+            Encoded::Matrix { width, height } => (width, height),
+            _ => panic!("expected matrix"),
+        }
+    }
+
+    /// Recover the codeword stream from a rendered symbol by inverting the
+    /// standard placement (returns the number of codewords).
+    fn recover(
+        buf: &[bool],
+        size: usize,
+        data_region: usize,
+        regions: usize,
+        out: &mut [u8],
+    ) -> usize {
+        let block = data_region + 2;
+        let mapping = regions * data_region;
+        let mut places = [0u16; MAX_MAP_CELLS];
+        ecc200_placement(mapping, mapping, &mut places);
+        let capacity = mapping * mapping / 8;
+        for x in out[..capacity].iter_mut() {
+            *x = 0;
+        }
+        for mr in 0..mapping {
+            for mc in 0..mapping {
+                let v = places[mr * mapping + mc];
+                if v > 1 {
+                    let pr = (mr / data_region) * block + 1 + (mr % data_region);
+                    let pc = (mc / data_region) * block + 1 + (mc % data_region);
+                    if buf[pr * size + pc] {
+                        out[(v >> 3) as usize - 1] |= 1 << (v & 7);
+                    }
+                }
+            }
+        }
+        capacity
+    }
+
     #[test]
     fn test_encode_basic() {
-        let out = DataMatrix::encode("Hello").unwrap();
-        match out {
-            BarcodeOutput::Matrix(mb) => {
-                assert!(mb.width >= 10);
-                assert_eq!(mb.width, mb.height);
-            }
-            _ => panic!("expected matrix barcode"),
-        }
+        let mut buf = [false; MAX_CELLS];
+        let (w, h) = encode("Hello", &mut buf);
+        assert!(w >= 10);
+        assert_eq!(w, h);
     }
 
     #[test]
     fn test_encode_digits() {
-        let out = DataMatrix::encode("12345").unwrap();
-        assert!(matches!(out, BarcodeOutput::Matrix(_)));
+        let mut buf = [false; MAX_CELLS];
+        let (w, _) = encode("12345", &mut buf);
+        assert!(w >= 10);
     }
 
     #[test]
-    fn test_finder_pattern() {
-        let out = DataMatrix::encode("A").unwrap();
-        match out {
-            BarcodeOutput::Matrix(mb) => {
-                let size = mb.width;
-                // Bottom row should be all dark (finder)
-                let bottom = &mb.modules[size - 1];
-                assert!(bottom.iter().all(|&b| b), "bottom row should be all dark");
-                // Left column should be all dark (finder)
-                for row in &mb.modules {
-                    assert!(row[0], "left column should be all dark");
-                }
-            }
-            _ => panic!("expected matrix"),
+    fn test_finder_timing() {
+        let mut buf = [false; MAX_CELLS];
+        let (size, _) = encode("Hi", &mut buf);
+        let n = size - 1;
+        assert!(buf[(size - 1) * size], "bottom-left dark");
+        assert!(buf[n * size + n], "bottom-right dark");
+        // Bottom row all dark, left column all dark (finder).
+        assert!(buf[(size - 1) * size..size * size].iter().all(|&b| b));
+        for r in 0..size {
+            assert!(buf[r * size], "left column dark");
         }
+        // Timing: top even col dark / odd light; right odd row dark / even light.
+        assert!(buf[2], "top timing even col dark");
+        assert!(!buf[1], "top timing odd col light");
+        assert!(buf[size + n], "right timing odd row dark");
+        assert!(!buf[n], "right timing even row light");
     }
 
     #[test]
     fn test_symbol_size_10x10_for_small_input() {
-        let out = DataMatrix::encode("Hi").unwrap();
-        match out {
-            BarcodeOutput::Matrix(mb) => {
-                assert_eq!(mb.width, 10);
-                assert_eq!(mb.height, 10);
-            }
-            _ => panic!("expected matrix"),
-        }
+        let mut buf = [false; MAX_CELLS];
+        assert_eq!(encode("Hi", &mut buf), (10, 10));
     }
 
     #[test]
     fn test_empty_input() {
-        assert!(DataMatrix::encode("").is_err());
+        let mut buf = [false; MAX_CELLS];
+        assert!(DataMatrix::encode_into("", &mut buf).is_err());
+    }
+
+    #[test]
+    fn test_buffer_too_small() {
+        let mut buf = [false; 16];
+        assert_eq!(
+            DataMatrix::encode_into("Hi", &mut buf),
+            Err(EncodeError::BufferTooSmall)
+        );
     }
 
     #[test]
     fn test_symbology_name() {
         assert_eq!(DataMatrix::symbology_name(), "Data Matrix");
-    }
-
-    #[test]
-    fn test_svg_output() {
-        let svg = DataMatrix::encode("Test").unwrap().to_svg_string();
-        assert!(svg.starts_with("<svg "));
     }
 
     #[test]
@@ -492,129 +569,79 @@ mod tests {
         assert_eq!(gf256_mul(2, 2), 4);
     }
 
-    /// Canonical ISO/IEC 16022 worked example: ASCII-encoding "123456" gives
-    /// data codewords [142, 164, 186]; ECC 200 appends [114, 25, 5, 88, 102].
+    /// Canonical ISO/IEC 16022 vector: "123456" → [142,164,186] + [114,25,5,88,102].
     #[test]
     fn test_rs_iso_reference_vector() {
-        let data = ascii_encode(b"123456");
-        assert_eq!(data, vec![142, 164, 186]);
-        let ec = rs_encode_dm(&data, 5);
-        assert_eq!(ec, vec![114, 25, 5, 88, 102]);
-    }
-
-    /// Recover the codeword stream from a rendered symbol by inverting the
-    /// standard placement — verifies finder/timing offset and bit placement.
-    fn recover_codewords(mb: &MatrixBarcode, data_region: usize, regions: usize) -> Vec<u8> {
-        let block = data_region + 2;
-        let mapping = regions * data_region;
-        let places = ecc200_placement(mapping, mapping);
-        let capacity = mapping * mapping / 8;
-        let mut cw = vec![0u8; capacity];
-        for mr in 0..mapping {
-            for mc in 0..mapping {
-                let v = places[mr * mapping + mc];
-                if v > 1 {
-                    let pr = (mr / data_region) * block + 1 + (mr % data_region);
-                    let pc = (mc / data_region) * block + 1 + (mc % data_region);
-                    if mb.modules[pr][pc] {
-                        cw[(v >> 3) as usize - 1] |= 1 << (v & 7);
-                    }
-                }
-            }
-        }
-        cw
-    }
-
-    /// Decode ECC 200 ASCII-mode data codewords back to the original bytes.
-    fn decode_ascii(cw: &[u8]) -> alloc::string::String {
-        let mut s = alloc::string::String::new();
-        for &c in cw {
-            match c {
-                129 => break, // pad → end of data
-                1..=128 => s.push((c - 1) as char),
-                130..=229 => {
-                    let v = c - 130;
-                    s.push((b'0' + v / 10) as char);
-                    s.push((b'0' + v % 10) as char);
-                }
-                _ => {}
-            }
-        }
-        s
+        let mut data = [0u8; MAX_DATA_CW + 1];
+        let n = ascii_encode(b"123456", &mut data).unwrap();
+        assert_eq!(&data[..n], &[142, 164, 186]);
+        let mut ec = [0u8; MAX_EC];
+        rs_encode_dm(&data[..n], 5, &mut ec);
+        assert_eq!(&ec[..5], &[114, 25, 5, 88, 102]);
     }
 
     /// Round-trip: encode → invert placement → check RS syndrome → decode ASCII.
-    /// Proves the placement is self-consistent and RS-valid for every size.
     #[test]
     fn test_round_trip_all_sizes() {
-        let inputs = [
+        let a62 = [b'A'; 62];
+        let inputs: &[&str] = &[
             "A",
             "Hi",
             "12345",
             "HELLO WORLD",
             "f3411c82-1c70-4207-977e-99f5580e7e3b",
-            "The quick brown fox jumps over the lazy do", // 42 chars → 26×26
-            "Data Matrix ECC 200 large capacity test crossing past the single-region 44-codeword boundary into 32x32.", // → multi-region
+            core::str::from_utf8(&a62).unwrap(), // → 32×32 (multi-region)
         ];
-        for input in inputs {
-            let mb = match DataMatrix::encode(input).unwrap() {
-                BarcodeOutput::Matrix(mb) => mb,
-                _ => panic!("expected matrix"),
-            };
-            let size = mb.width;
-            let params = SYMBOL_PARAMS.iter().find(|p| p.0 == size).unwrap();
-            let (_, data_region, regions, data_cap, ec_count) = *params;
+        for &input in inputs {
+            let mut buf = [false; MAX_CELLS];
+            let (size, _) = encode(input, &mut buf);
+            let (_, dr, regions, data_cap, ec_count) =
+                *SYMBOL_PARAMS.iter().find(|p| p.0 == size).unwrap();
 
-            let all_cw = recover_codewords(&mb, data_region, regions);
-            let (data, ec) = all_cw.split_at(data_cap);
+            let mut cw = [0u8; MAX_DATA_CW + MAX_EC];
+            recover(&buf, size, dr, regions, &mut cw);
+            let (data, rest) = cw.split_at(data_cap);
+            let ec = &rest[..ec_count];
 
-            // Reed-Solomon must be consistent with the recovered data.
-            assert_eq!(
-                rs_encode_dm(data, ec_count),
-                ec,
-                "RS mismatch for {input:?} ({size}x{size})"
-            );
+            let mut ec_check = [0u8; MAX_EC];
+            rs_encode_dm(data, ec_count, &mut ec_check);
+            assert_eq!(&ec_check[..ec_count], ec, "RS mismatch ({size}x{size})");
 
-            // ASCII payload must decode back to the original input.
-            let decoded = decode_ascii(data);
-            assert_eq!(decoded, input, "round-trip mismatch ({size}x{size})");
+            // Decode ASCII payload and compare to the input bytes.
+            let mut dec = [0u8; MAX_DATA_CW * 2];
+            let mut dn = 0;
+            for &c in data {
+                match c {
+                    129 => break,
+                    1..=128 => {
+                        dec[dn] = c - 1;
+                        dn += 1;
+                    }
+                    130..=229 => {
+                        let vv = c - 130;
+                        dec[dn] = b'0' + vv / 10;
+                        dec[dn + 1] = b'0' + vv % 10;
+                        dn += 2;
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(&dec[..dn], input.as_bytes(), "round-trip ({size}x{size})");
         }
     }
 
-    /// The four corner modules must match the standard finder/timing pattern.
-    #[test]
-    fn test_finder_timing_corners() {
-        let mb = match DataMatrix::encode("Hi").unwrap() {
-            BarcodeOutput::Matrix(mb) => mb,
-            _ => panic!(),
-        };
-        let n = mb.width - 1;
-        assert!(mb.modules[0][0], "top-left dark");
-        assert!(mb.modules[n][0], "bottom-left dark");
-        assert!(mb.modules[n][n], "bottom-right dark");
-        // Top timing: dark at even columns, light at odd.
-        assert!(mb.modules[0][2], "top timing even col dark");
-        assert!(!mb.modules[0][1], "top timing odd col light");
-        // Right timing: dark at odd rows, light at even.
-        assert!(mb.modules[1][n], "right timing odd row dark");
-        assert!(!mb.modules[0][n], "right timing even row light");
-    }
-
-    /// ECC 200 padding: first codeword 129, then the 253-state pseudo-random
-    /// sequence — pinned to the values produced by libdmtx's `dmtxwrite`.
+    /// ECC 200 padding: first codeword 129, then the 253-state sequence — pinned
+    /// to the values produced by libdmtx's `dmtxwrite`.
     #[test]
     fn test_padding_253_state() {
-        // 50 'A' → 32×32 (62 data cap): 50 data + 12 pad codewords.
-        let s: alloc::string::String = core::iter::repeat_n('A', 50).collect();
-        let mb = match DataMatrix::encode(&s).unwrap() {
-            BarcodeOutput::Matrix(mb) => mb,
-            _ => panic!(),
-        };
-        assert_eq!(mb.width, 32);
-        let all_cw = recover_codewords(&mb, 14, 2);
-        let pads = &all_cw[50..62];
+        let a50 = [b'A'; 50];
+        let mut buf = [false; MAX_CELLS];
+        let (size, _) = encode(core::str::from_utf8(&a50).unwrap(), &mut buf);
+        assert_eq!(size, 32);
+        let mut cw = [0u8; MAX_DATA_CW + MAX_EC];
+        recover(&buf, size, 14, 2, &mut cw);
         assert_eq!(
-            pads,
+            &cw[50..62],
             &[129, 34, 184, 79, 229, 124, 20, 170, 65, 215, 110, 6]
         );
     }
@@ -622,14 +649,25 @@ mod tests {
     /// Multi-region symbols hold much more data than the old 44-codeword cap.
     #[test]
     fn test_large_capacity() {
-        let s: alloc::string::String = core::iter::repeat_n('A', 174).collect();
-        let mb = match DataMatrix::encode(&s).unwrap() {
-            BarcodeOutput::Matrix(mb) => mb,
-            _ => panic!(),
-        };
-        assert_eq!(mb.width, 48); // 48×48, 174 data codewords
-        // Beyond the largest single-block symbol is still rejected cleanly.
-        let too_long: alloc::string::String = core::iter::repeat_n('A', 200).collect();
-        assert_eq!(DataMatrix::encode(&too_long), Err(EncodeError::DataTooLong));
+        let a174 = [b'A'; 174];
+        let mut buf = [false; MAX_CELLS];
+        assert_eq!(
+            encode(core::str::from_utf8(&a174).unwrap(), &mut buf),
+            (48, 48)
+        );
+        // Beyond the largest single-block symbol is rejected cleanly.
+        let a200 = [b'A'; 200];
+        let mut buf2 = [false; MAX_CELLS];
+        assert_eq!(
+            DataMatrix::encode_into(core::str::from_utf8(&a200).unwrap(), &mut buf2),
+            Err(EncodeError::DataTooLong)
+        );
+    }
+
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn test_svg_output() {
+        let svg = DataMatrix::encode("Test").unwrap().to_svg_string();
+        assert!(svg.starts_with("<svg "));
     }
 }

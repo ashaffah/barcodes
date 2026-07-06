@@ -1,6 +1,6 @@
 [package]
 name = "barcodes"
-version = "0.1.3"
+version = "0.2.0"
 edition = "2024"
 description = "Universal Bar/QR codes library"
 keywords = ["barcode", "qrcode", "ean", "code128", "pdf417"]
@@ -12,7 +12,8 @@ exclude = ["/examples", "/generated_barcodes"]
 
 [features]
 default = []
-std = []
+alloc = []
+std = ["alloc"]
 image = ["std", "dep:image"]
 
 [dependencies]
@@ -22,6 +23,10 @@ version = "0.25"
 optional = true
 default-features = false
 features = ["png", "gif", "webp"]
+
+[[example]]
+name = "gen_all"
+required-features = ["image"]
 
 [package.metadata.docs.rs]
 all-features = true

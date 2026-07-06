@@ -20,20 +20,24 @@
 //!
 //! ```rust
 //! use barcodes::common::traits::BarcodeEncoder;
+//! use barcodes::common::types::Encoded;
 //! use barcodes::linear::code128::Code128;
 //!
-//! let out = Code128::encode("Hello").unwrap();
+//! let mut buf = [false; 512];
+//! let Encoded::Linear { len, .. } = Code128::encode_into("Hello", &mut buf).unwrap()
+//! else { unreachable!() };
+//! let bars = &buf[..len];
 //! ```
 #![forbid(unsafe_code)]
 
-extern crate alloc;
-use alloc::vec::Vec;
-
 use crate::common::{
-    errors::EncodeError,
-    traits::BarcodeEncoder,
-    types::{BarcodeOutput, LinearBarcode},
+    buffer::SliceWriter, errors::EncodeError, traits::BarcodeEncoder, types::Encoded,
 };
+
+/// Maximum number of input bytes supported in a single symbol.
+pub(crate) const MAX_DATA: usize = 512;
+/// Maximum number of Code 128 symbols (data + start + check + stop).
+pub(crate) const MAX_SYMBOLS: usize = MAX_DATA + 3;
 
 // ---- Symbol table ----------------------------------------------------------
 
@@ -199,7 +203,7 @@ fn best_subset(input: &[u8]) -> Result<Subset, EncodeError> {
             return Ok(Subset::A);
         }
         return Err(EncodeError::InvalidInput(
-            "input contains characters not encodable in Code 128A".into(),
+            "input contains characters not encodable in Code 128A",
         ));
     }
 
@@ -209,7 +213,7 @@ fn best_subset(input: &[u8]) -> Result<Subset, EncodeError> {
     }
 
     Err(EncodeError::InvalidInput(
-        "input contains characters outside the Code 128 character set".into(),
+        "input contains characters outside the Code 128 character set",
     ))
 }
 
@@ -235,38 +239,44 @@ pub struct Code128;
 
 impl BarcodeEncoder for Code128 {
     type Input = str;
-    type Error = EncodeError;
 
-    fn encode(input: &str) -> Result<BarcodeOutput, EncodeError> {
+    fn encode_into(input: &str, buf: &mut [bool]) -> Result<Encoded, EncodeError> {
         if input.is_empty() {
             return Err(EncodeError::InvalidInput(
-                "Code 128 input must not be empty".into(),
+                "Code 128 input must not be empty",
             ));
         }
 
         let bytes = input.as_bytes();
+        if bytes.len() > MAX_DATA {
+            return Err(EncodeError::DataTooLong);
+        }
         let subset = best_subset(bytes)?;
 
-        let mut symbol_indices: Vec<u8> = Vec::with_capacity(bytes.len() + 4);
+        // Collect symbol indices in a fixed stack buffer.
+        let mut symbols = [0u8; MAX_SYMBOLS];
+        let mut n = 0;
 
         // Start code
-        let start = match subset {
+        symbols[n] = match subset {
             Subset::A => START_A,
             Subset::B => START_B,
             Subset::C => START_C,
         };
-        symbol_indices.push(start);
+        n += 1;
 
         // Data symbols
         match subset {
             Subset::A => {
                 for &b in bytes {
-                    symbol_indices.push(symbol_value_a(b));
+                    symbols[n] = symbol_value_a(b);
+                    n += 1;
                 }
             }
             Subset::B => {
                 for &b in bytes {
-                    symbol_indices.push(symbol_value_b(b));
+                    symbols[n] = symbol_value_b(b);
+                    n += 1;
                 }
             }
             Subset::C => {
@@ -274,27 +284,21 @@ impl BarcodeEncoder for Code128 {
                 while i + 1 < bytes.len() {
                     let tens = bytes[i] - b'0';
                     let units = bytes[i + 1] - b'0';
-                    symbol_indices.push(tens * 10 + units);
+                    symbols[n] = tens * 10 + units;
+                    n += 1;
                     i += 2;
                 }
             }
         }
 
-        // Check symbol (weighted modulo-103 sum)
-        let check = compute_check(&symbol_indices);
-        symbol_indices.push(check);
+        // Check symbol (weighted modulo-103 sum), then stop.
+        symbols[n] = compute_check(&symbols[..n]);
+        n += 1;
+        symbols[n] = STOP;
+        n += 1;
 
-        // Stop
-        symbol_indices.push(STOP);
-
-        // Convert symbols to bar/space widths
-        let bars = symbols_to_bars(&symbol_indices);
-
-        Ok(BarcodeOutput::Linear(LinearBarcode {
-            bars,
-            height: 50,
-            text: Some(input.into()),
-        }))
+        let len = symbols_to_bars(&symbols[..n], buf)?;
+        Ok(Encoded::Linear { len, height: 50 })
     }
 
     fn symbology_name() -> &'static str {
@@ -316,9 +320,11 @@ pub(crate) fn compute_check(symbols: &[u8]) -> u8 {
     ((start_val + weighted) % 103) as u8
 }
 
-/// Expand symbol indices into a `Vec<bool>` of dark/light modules.
-pub(crate) fn symbols_to_bars(symbols: &[u8]) -> Vec<bool> {
-    let mut bars: Vec<bool> = Vec::new();
+/// Expand symbol indices into dark/light modules written into `buf`.
+///
+/// Returns the number of modules written.
+pub(crate) fn symbols_to_bars(symbols: &[u8], buf: &mut [bool]) -> Result<usize, EncodeError> {
+    let mut w = SliceWriter::new(buf);
 
     for &sym in symbols.iter() {
         let is_stop = sym == STOP;
@@ -327,19 +333,17 @@ pub(crate) fn symbols_to_bars(symbols: &[u8]) -> Vec<bool> {
         // Alternate dark/light starting with dark for every symbol.
         let mut dark = true;
         for &width in pattern.iter() {
-            for _ in 0..width {
-                bars.push(dark);
-            }
+            w.push_run(dark, width as usize)?;
             dark = !dark;
         }
 
         // The stop symbol has a final termination bar (2 dark modules).
         if is_stop {
-            bars.extend(core::iter::repeat_n(true, STOP_TERMINATION as usize));
+            w.push_run(true, STOP_TERMINATION as usize)?;
         }
     }
 
-    bars
+    Ok(w.len())
 }
 
 // ---- Tests -----------------------------------------------------------------
@@ -348,58 +352,57 @@ pub(crate) fn symbols_to_bars(symbols: &[u8]) -> Vec<bool> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_encode_subset_b_basic() {
-        let out = Code128::encode("Hello").unwrap();
-        match out {
-            BarcodeOutput::Linear(lb) => {
-                // Start B + 5 data + check + stop = 8 symbols
-                // Each of the 7 non-stop symbols = 11 modules, stop = 13 modules
-                // Total = 7*11 + 13 = 77 + 13 = 90
-                assert_eq!(lb.bars.len(), 90);
-            }
+    fn encode_len(input: &str) -> usize {
+        let mut buf = [false; 4096];
+        match Code128::encode_into(input, &mut buf).unwrap() {
+            Encoded::Linear { len, .. } => len,
             _ => panic!("expected linear"),
         }
     }
 
     #[test]
+    fn test_encode_subset_b_basic() {
+        // Start B + 5 data + check + stop = 7 non-stop symbols (11 mod) + stop (13).
+        assert_eq!(encode_len("Hello"), 7 * 11 + 13);
+    }
+
+    #[test]
     fn test_encode_subset_c() {
-        // Even-length all-digit input → Code C
-        let out = Code128::encode("123456").unwrap();
-        match out {
-            BarcodeOutput::Linear(lb) => {
-                // Start C + 3 data pairs + check + stop = 5 non-stop + stop
-                // 5 × 11 + 13 (stop) = 68
-                assert_eq!(lb.bars.len(), 68);
-            }
-            _ => panic!("expected linear"),
-        }
+        // Start C + 3 pairs + check + stop = 5 × 11 + 13.
+        assert_eq!(encode_len("123456"), 5 * 11 + 13);
     }
 
     #[test]
     fn test_encode_subset_a_control() {
         // Contains a control character (BEL = 0x07)
-        let input = "\x07ABC";
-        let out = Code128::encode(input).unwrap();
-        assert!(matches!(out, BarcodeOutput::Linear(_)));
+        assert!(encode_len("\x07ABC") > 0);
     }
 
     #[test]
     fn test_empty_input_error() {
-        assert!(Code128::encode("").is_err());
+        let mut buf = [false; 4096];
+        assert!(Code128::encode_into("", &mut buf).is_err());
     }
 
     #[test]
     fn test_invalid_high_byte() {
-        assert!(Code128::encode("caf\u{00E9}").is_err());
+        let mut buf = [false; 4096];
+        assert!(Code128::encode_into("caf\u{00E9}", &mut buf).is_err());
+    }
+
+    #[test]
+    fn test_buffer_too_small() {
+        let mut buf = [false; 16];
+        assert_eq!(
+            Code128::encode_into("Hello", &mut buf),
+            Err(EncodeError::BufferTooSmall)
+        );
     }
 
     #[test]
     fn test_check_computation() {
-        // Manually verify check for "PJJ123C" — known Code 128B example.
-        // We just verify the function returns without panic and result is in range.
-        let out = Code128::encode("PJJ123C").unwrap();
-        assert!(matches!(out, BarcodeOutput::Linear(_)));
+        // "PJJ123C" — known Code 128B example; just verify it encodes.
+        assert!(encode_len("PJJ123C") > 0);
     }
 
     #[test]
@@ -407,6 +410,7 @@ mod tests {
         assert_eq!(Code128::symbology_name(), "Code 128");
     }
 
+    #[cfg(feature = "alloc")]
     #[test]
     fn test_svg_output() {
         let svg = Code128::encode("Test").unwrap().to_svg_string();

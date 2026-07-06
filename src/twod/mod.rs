@@ -8,3 +8,4 @@
 pub mod aztec;
 pub mod datamatrix;
 pub mod pdf417;
+mod pdf417_table;

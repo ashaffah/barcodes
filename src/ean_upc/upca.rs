@@ -13,14 +13,9 @@
 //! The check digit uses the same weighted-sum algorithm as EAN-13.
 #![forbid(unsafe_code)]
 
-extern crate alloc;
-use alloc::{format, string::String, vec::Vec};
-
 use super::ean13::{GUARD_CENTRE, GUARD_NORMAL, L_CODE, R_CODE, check_digit};
 use crate::common::{
-    errors::EncodeError,
-    traits::BarcodeEncoder,
-    types::{BarcodeOutput, LinearBarcode},
+    buffer::SliceWriter, errors::EncodeError, traits::BarcodeEncoder, types::Encoded,
 };
 
 /// UPC-A barcode encoder.
@@ -32,29 +27,24 @@ use crate::common::{
 ///
 /// ```rust
 /// use barcodes::common::traits::BarcodeEncoder;
+/// use barcodes::common::types::Encoded;
 /// use barcodes::ean_upc::upca::UpcA;
 ///
-/// // 12 digits — check digit validated
-/// let out = UpcA::encode("012345678905").unwrap();
-///
+/// let mut buf = [false; 128];
 /// // 11 digits — check digit auto-computed
-/// let out2 = UpcA::encode("01234567890").unwrap();
+/// let Encoded::Linear { len, .. } = UpcA::encode_into("01234567890", &mut buf).unwrap()
+/// else { unreachable!() };
+/// assert_eq!(len, 95);
 /// ```
 pub struct UpcA;
 
 impl BarcodeEncoder for UpcA {
     type Input = str;
-    type Error = EncodeError;
 
-    fn encode(input: &str) -> Result<BarcodeOutput, EncodeError> {
+    fn encode_into(input: &str, buf: &mut [bool]) -> Result<Encoded, EncodeError> {
         let digits = parse_and_validate(input)?;
-        let bars = encode_bars(&digits);
-
-        Ok(BarcodeOutput::Linear(LinearBarcode {
-            bars,
-            height: 69,
-            text: Some(format_text(&digits)),
-        }))
+        let len = encode_bars(&digits, buf)?;
+        Ok(Encoded::Linear { len, height: 69 })
     }
 
     fn symbology_name() -> &'static str {
@@ -68,7 +58,7 @@ fn parse_and_validate(input: &str) -> Result<[u8; 12], EncodeError> {
     let trimmed = input.trim();
     if !trimmed.chars().all(|c| c.is_ascii_digit()) {
         return Err(EncodeError::InvalidInput(
-            "UPC-A input must contain digits only".into(),
+            "UPC-A input must contain digits only",
         ));
     }
     match trimmed.len() {
@@ -87,46 +77,39 @@ fn parse_and_validate(input: &str) -> Result<[u8; 12], EncodeError> {
             }
             let expected = check_digit(&digits[..11]);
             if digits[11] != expected {
-                return Err(EncodeError::InvalidInput(format!(
-                    "check digit mismatch: got {}, expected {expected}",
-                    digits[11]
-                )));
+                return Err(EncodeError::InvalidInput("UPC-A check digit mismatch"));
             }
             Ok(digits)
         }
         _ => Err(EncodeError::InvalidInput(
-            "UPC-A input must be 11 or 12 digits".into(),
+            "UPC-A input must be 11 or 12 digits",
         )),
     }
 }
 
-fn encode_bars(digits: &[u8; 12]) -> Vec<bool> {
-    let mut bars: Vec<bool> = Vec::with_capacity(95);
+fn encode_bars(digits: &[u8; 12], buf: &mut [bool]) -> Result<usize, EncodeError> {
+    let mut w = SliceWriter::new(buf);
 
     // Start guard: 101
-    bars.extend_from_slice(&GUARD_NORMAL);
+    w.extend(GUARD_NORMAL.iter().copied())?;
 
     // Left 6 digits — all L-code
     for &d in &digits[0..6] {
-        bars.extend_from_slice(&L_CODE[d as usize]);
+        w.extend(L_CODE[d as usize].iter().copied())?;
     }
 
     // Centre guard: 01010
-    bars.extend_from_slice(&GUARD_CENTRE);
+    w.extend(GUARD_CENTRE.iter().copied())?;
 
     // Right 6 digits — all R-code
     for &d in &digits[6..12] {
-        bars.extend_from_slice(&R_CODE[d as usize]);
+        w.extend(R_CODE[d as usize].iter().copied())?;
     }
 
     // End guard: 101
-    bars.extend_from_slice(&GUARD_NORMAL);
+    w.extend(GUARD_NORMAL.iter().copied())?;
 
-    bars
-}
-
-fn format_text(digits: &[u8; 12]) -> String {
-    digits.iter().map(|d| (b'0' + d) as char).collect()
+    Ok(w.len())
 }
 
 // ---- Tests -----------------------------------------------------------------
@@ -151,38 +134,45 @@ mod tests {
         assert_eq!(check_digit(&digits), 2);
     }
 
-    #[test]
-    fn test_encode_12_digits() {
-        let out = UpcA::encode("012345678905").unwrap();
-        match out {
-            BarcodeOutput::Linear(lb) => {
-                assert_eq!(lb.bars.len(), 95);
-                assert_eq!(lb.text.as_deref(), Some("012345678905"));
-            }
-            _ => panic!("expected linear barcode"),
+    fn bars<'a>(input: &str, buf: &'a mut [bool]) -> &'a [bool] {
+        match UpcA::encode_into(input, buf).unwrap() {
+            Encoded::Linear { len, .. } => &buf[..len],
+            _ => panic!("expected linear"),
         }
     }
 
     #[test]
+    fn test_encode_12_digits() {
+        let mut buf = [false; 128];
+        assert_eq!(bars("012345678905", &mut buf).len(), 95);
+    }
+
+    #[test]
     fn test_encode_11_digits_auto_check() {
-        let out11 = UpcA::encode("01234567890").unwrap();
-        let out12 = UpcA::encode("012345678905").unwrap();
-        assert_eq!(out11, out12);
+        let mut buf11 = [false; 128];
+        let mut buf12 = [false; 128];
+        assert_eq!(
+            bars("01234567890", &mut buf11),
+            bars("012345678905", &mut buf12)
+        );
     }
 
     #[test]
     fn test_invalid_check_digit() {
-        assert!(UpcA::encode("012345678900").is_err());
+        let mut buf = [false; 128];
+        assert!(UpcA::encode_into("012345678900", &mut buf).is_err());
     }
 
     #[test]
     fn test_invalid_characters() {
-        assert!(UpcA::encode("01234567890X").is_err());
+        let mut buf = [false; 128];
+        assert!(UpcA::encode_into("01234567890X", &mut buf).is_err());
     }
 
     #[test]
     fn test_wrong_length() {
-        assert!(UpcA::encode("01234").is_err());
+        let mut buf = [false; 128];
+        assert!(UpcA::encode_into("01234", &mut buf).is_err());
     }
 
     #[test]
@@ -190,6 +180,7 @@ mod tests {
         assert_eq!(UpcA::symbology_name(), "UPC-A");
     }
 
+    #[cfg(feature = "alloc")]
     #[test]
     fn test_svg_output() {
         let svg = UpcA::encode("012345678905").unwrap().to_svg_string();

@@ -14,13 +14,8 @@
 //! Input must have an even number of digits.
 #![forbid(unsafe_code)]
 
-extern crate alloc;
-use alloc::{string::String, vec, vec::Vec};
-
 use crate::common::{
-    errors::EncodeError,
-    traits::BarcodeEncoder,
-    types::{BarcodeOutput, LinearBarcode},
+    buffer::SliceWriter, errors::EncodeError, traits::BarcodeEncoder, types::Encoded,
 };
 
 // ---- Encoding table --------------------------------------------------------
@@ -52,47 +47,36 @@ const ITF_TABLE: [[bool; 5]; 10] = [
 ///
 /// ```rust
 /// use barcodes::common::traits::BarcodeEncoder;
+/// use barcodes::common::types::Encoded;
 /// use barcodes::linear::itf::Itf;
 ///
-/// let out = Itf::encode("12345678").unwrap();
+/// let mut buf = [false; 256];
+/// let Encoded::Linear { len, .. } = Itf::encode_into("12345678", &mut buf).unwrap()
+/// else { unreachable!() };
+/// let bars = &buf[..len];
 /// ```
 pub struct Itf;
 
 impl BarcodeEncoder for Itf {
     type Input = str;
-    type Error = EncodeError;
 
-    fn encode(input: &str) -> Result<BarcodeOutput, EncodeError> {
+    fn encode_into(input: &str, buf: &mut [bool]) -> Result<Encoded, EncodeError> {
         let trimmed = input.trim();
         if trimmed.is_empty() {
-            return Err(EncodeError::InvalidInput(
-                "ITF input must not be empty".into(),
-            ));
+            return Err(EncodeError::InvalidInput("ITF input must not be empty"));
         }
         if !trimmed.chars().all(|c| c.is_ascii_digit()) {
             return Err(EncodeError::InvalidInput(
-                "ITF input must contain digits only".into(),
+                "ITF input must contain digits only",
             ));
         }
 
-        // Pad to even length with leading zero if necessary
-        let padded: String = if !trimmed.len().is_multiple_of(2) {
-            let mut s = String::with_capacity(trimmed.len() + 1);
-            s.push('0');
-            s.push_str(trimmed);
-            s
-        } else {
-            trimmed.into()
-        };
+        // Pad to even length with a virtual leading zero if necessary — no
+        // allocation, handled by an index offset in `encode_bars`.
+        let pad = !trimmed.len().is_multiple_of(2);
+        let len = encode_bars(trimmed.as_bytes(), pad, buf)?;
 
-        let digits: Vec<u8> = padded.bytes().map(|b| b - b'0').collect();
-        let bars = encode_bars(&digits);
-
-        Ok(BarcodeOutput::Linear(LinearBarcode {
-            bars,
-            height: 50,
-            text: Some(trimmed.into()),
-        }))
+        Ok(Encoded::Linear { len, height: 50 })
     }
 
     fn symbology_name() -> &'static str {
@@ -102,46 +86,44 @@ impl BarcodeEncoder for Itf {
 
 // ---- Helpers ---------------------------------------------------------------
 
-/// Push a single module (narrow or wide) of given polarity.
-#[inline]
-fn push_module(bars: &mut Vec<bool>, dark: bool, wide: bool) {
-    let width = if wide { 3 } else { 1 };
-    for _ in 0..width {
-        bars.push(dark);
-    }
-}
-
-fn encode_bars(digits: &[u8]) -> Vec<bool> {
-    // Start pattern: 4 narrow bars/spaces = NNNN = dark, light, dark, light
-    let mut bars: Vec<bool> = vec![true, false, true, false];
-
-    // Encode pairs
-    let mut i = 0;
-    while i + 1 < digits.len() {
-        let d1 = digits[i] as usize; // encoded in bars
-        let d2 = digits[i + 1] as usize; // encoded in spaces
-
-        let p1 = &ITF_TABLE[d1];
-        let p2 = &ITF_TABLE[d2];
-
-        // Interleave: for each of the 5 element positions,
-        // emit bar from d1 then space from d2
-        for j in 0..5 {
-            push_module(&mut bars, true, p1[j]); // bar
-            push_module(&mut bars, false, p2[j]); // space
+fn encode_bars(digits: &[u8], pad: bool, buf: &mut [bool]) -> Result<usize, EncodeError> {
+    let pad = pad as usize;
+    let total = digits.len() + pad;
+    // Logical digit at position `i`, treating a leading pad zero if present.
+    let digit = |i: usize| -> usize {
+        if i < pad {
+            0
+        } else {
+            (digits[i - pad] - b'0') as usize
         }
+    };
 
+    let mut w = SliceWriter::new(buf);
+
+    // Start pattern: 4 narrow bars/spaces = NNNN = dark, light, dark, light
+    w.push(true)?;
+    w.push(false)?;
+    w.push(true)?;
+    w.push(false)?;
+
+    // Encode pairs: first digit in bars, second in spaces.
+    let mut i = 0;
+    while i + 1 < total {
+        let p1 = &ITF_TABLE[digit(i)];
+        let p2 = &ITF_TABLE[digit(i + 1)];
+        for j in 0..5 {
+            w.push_run(true, if p1[j] { 3 } else { 1 })?; // bar
+            w.push_run(false, if p2[j] { 3 } else { 1 })?; // space
+        }
         i += 2;
     }
 
     // Stop pattern: WNN = wide-bar, narrow-space, narrow-bar
-    bars.push(true); // wide bar (3 modules)
-    bars.push(true);
-    bars.push(true);
-    bars.push(false); // narrow space
-    bars.push(true); // narrow bar
+    w.push_run(true, 3)?; // wide bar
+    w.push(false)?; // narrow space
+    w.push(true)?; // narrow bar
 
-    bars
+    Ok(w.len())
 }
 
 // ---- Tests -----------------------------------------------------------------
@@ -150,35 +132,48 @@ fn encode_bars(digits: &[u8]) -> Vec<bool> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_encode_even_digits() {
-        let out = Itf::encode("12345678").unwrap();
-        assert!(matches!(out, BarcodeOutput::Linear(_)));
-    }
-
-    #[test]
-    fn test_encode_odd_digits_padded() {
-        // Should prepend a zero and succeed; bars should be identical
-        let out_odd = Itf::encode("1234567").unwrap();
-        let out_even = Itf::encode("01234567").unwrap();
-        assert!(matches!(out_odd, BarcodeOutput::Linear(_)));
-        // The bars should be the same (only text label differs)
-        match (out_odd, out_even) {
-            (BarcodeOutput::Linear(odd), BarcodeOutput::Linear(even)) => {
-                assert_eq!(odd.bars, even.bars);
-            }
+    fn encode<'a>(input: &str, buf: &'a mut [bool]) -> &'a [bool] {
+        match Itf::encode_into(input, buf).unwrap() {
+            Encoded::Linear { len, .. } => &buf[..len],
             _ => panic!("expected linear"),
         }
     }
 
     #[test]
+    fn test_encode_even_digits() {
+        let mut buf = [false; 512];
+        assert!(!encode("12345678", &mut buf).is_empty());
+    }
+
+    #[test]
+    fn test_encode_odd_digits_padded() {
+        // Odd length gets a virtual leading zero; bars must match the padded form.
+        let mut buf_odd = [false; 512];
+        let mut buf_even = [false; 512];
+        let odd = encode("1234567", &mut buf_odd);
+        let even = encode("01234567", &mut buf_even);
+        assert_eq!(odd, even);
+    }
+
+    #[test]
     fn test_invalid_characters() {
-        assert!(Itf::encode("1234A678").is_err());
+        let mut buf = [false; 512];
+        assert!(Itf::encode_into("1234A678", &mut buf).is_err());
     }
 
     #[test]
     fn test_empty_input() {
-        assert!(Itf::encode("").is_err());
+        let mut buf = [false; 512];
+        assert!(Itf::encode_into("", &mut buf).is_err());
+    }
+
+    #[test]
+    fn test_buffer_too_small() {
+        let mut buf = [false; 8];
+        assert_eq!(
+            Itf::encode_into("12345678", &mut buf),
+            Err(EncodeError::BufferTooSmall)
+        );
     }
 
     #[test]
@@ -188,29 +183,12 @@ mod tests {
 
     #[test]
     fn test_bar_length_two_digits() {
-        // Input "12": 1 pair
-        // Start: 4 modules
-        // Pair: 5 interleaved elements, each 1 or 3 modules for bar + 1 or 3 for space
-        // Stop: 3+1+1 = 5 modules
-        let out = Itf::encode("12").unwrap();
-        match out {
-            BarcodeOutput::Linear(lb) => {
-                // Digit 1 = WNNNW, digit 2 = NWNNW
-                // Pair encoding: interleave bars of d1 with spaces of d2
-                // Pos0: bar W(3) + space N(1) = 4
-                // Pos1: bar N(1) + space W(3) = 4
-                // Pos2: bar N(1) + space N(1) = 2
-                // Pos3: bar N(1) + space N(1) = 2
-                // Pos4: bar W(3) + space W(3) = 6
-                // Total pair = 18
-                // Start = 4, stop = 5
-                // Total = 4 + 18 + 5 = 27
-                assert_eq!(lb.bars.len(), 27);
-            }
-            _ => panic!("expected linear"),
-        }
+        // Input "12": start(4) + pair(18) + stop(5) = 27 modules.
+        let mut buf = [false; 512];
+        assert_eq!(encode("12", &mut buf).len(), 27);
     }
 
+    #[cfg(feature = "alloc")]
     #[test]
     fn test_svg_output() {
         let svg = Itf::encode("1234").unwrap().to_svg_string();

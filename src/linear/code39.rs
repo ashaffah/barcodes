@@ -10,13 +10,8 @@
 //! `*` (asterisk) start/stop character.
 #![forbid(unsafe_code)]
 
-extern crate alloc;
-use alloc::vec::Vec;
-
 use crate::common::{
-    errors::EncodeError,
-    traits::BarcodeEncoder,
-    types::{BarcodeOutput, LinearBarcode},
+    buffer::SliceWriter, errors::EncodeError, traits::BarcodeEncoder, types::Encoded,
 };
 
 // ---- Character encoding table (for reference) ------------------------------
@@ -215,40 +210,33 @@ const CODE39_TABLE: &[(char, [bool; 9])] = &[
 ///
 /// ```rust
 /// use barcodes::common::traits::BarcodeEncoder;
+/// use barcodes::common::types::Encoded;
 /// use barcodes::linear::code39::Code39;
 ///
-/// let out = Code39::encode("CODE39").unwrap();
+/// let mut buf = [false; 256];
+/// let Encoded::Linear { len, .. } = Code39::encode_into("CODE39", &mut buf).unwrap()
+/// else { unreachable!() };
+/// let bars = &buf[..len];
 /// ```
 pub struct Code39;
 
 impl BarcodeEncoder for Code39 {
     type Input = str;
-    type Error = EncodeError;
 
-    fn encode(input: &str) -> Result<BarcodeOutput, EncodeError> {
+    fn encode_into(input: &str, buf: &mut [bool]) -> Result<Encoded, EncodeError> {
         if input.is_empty() {
-            return Err(EncodeError::InvalidInput(
-                "Code 39 input must not be empty".into(),
-            ));
+            return Err(EncodeError::InvalidInput("Code 39 input must not be empty"));
         }
 
         // Validate all characters
         for ch in input.chars() {
             if lookup_pattern(ch).is_none() {
-                return Err(EncodeError::InvalidInput(alloc::format!(
-                    "character '{ch}' is not valid in Code 39"
-                )));
+                return Err(EncodeError::InvalidCharacter(ch));
             }
         }
 
-        let bars = encode_bars(input);
-        let text = input.into();
-
-        Ok(BarcodeOutput::Linear(LinearBarcode {
-            bars,
-            height: 50,
-            text: Some(text),
-        }))
+        let len = encode_bars(input, buf)?;
+        Ok(Encoded::Linear { len, height: 50 })
     }
 
     fn symbology_name() -> &'static str {
@@ -266,43 +254,38 @@ fn lookup_pattern(ch: char) -> Option<&'static [bool; 9]> {
 ///
 /// narrow = 1 module, wide = 3 modules.
 /// Elements alternate: bar, space, bar, space, …, bar (9 elements).
-fn append_char(bars: &mut Vec<bool>, pattern: &[bool; 9]) {
+fn append_char(w: &mut SliceWriter, pattern: &[bool; 9]) -> Result<(), EncodeError> {
     for (i, &wide) in pattern.iter().enumerate() {
         let is_bar = i % 2 == 0; // even indices are bars
         let width = if wide { 3 } else { 1 };
-        let module = is_bar; // dark for bars, light for spaces
-        for _ in 0..width {
-            bars.push(module);
-        }
+        w.push_run(is_bar, width)?; // dark for bars, light for spaces
     }
+    Ok(())
 }
 
-fn encode_bars(input: &str) -> Vec<bool> {
-    // Estimate capacity: start + chars + stop + inter-char gaps
-    // Each char: max 3+1+3+1+3+1+3+1+3 = 17 modules (all narrow = 9)
-    // Typical: ~13 modules per char
-    let mut bars: Vec<bool> = Vec::new();
+fn encode_bars(input: &str, buf: &mut [bool]) -> Result<usize, EncodeError> {
+    let mut w = SliceWriter::new(buf);
 
     let star = lookup_pattern('*').expect("star pattern must exist");
 
     // Start character
-    append_char(&mut bars, star);
+    append_char(&mut w, star)?;
 
     for ch in input.chars() {
         // Inter-character gap: 1 narrow space (light)
-        bars.push(false);
+        w.push(false)?;
 
         let pattern = lookup_pattern(ch).expect("already validated");
-        append_char(&mut bars, pattern);
+        append_char(&mut w, pattern)?;
     }
 
     // Inter-character gap before stop
-    bars.push(false);
+    w.push(false)?;
 
     // Stop character
-    append_char(&mut bars, star);
+    append_char(&mut w, star)?;
 
-    bars
+    Ok(w.len())
 }
 
 // ---- Tests -----------------------------------------------------------------
@@ -311,38 +294,55 @@ fn encode_bars(input: &str) -> Vec<bool> {
 mod tests {
     use super::*;
 
+    fn encode_len(input: &str) -> usize {
+        let mut buf = [false; 1024];
+        match Code39::encode_into(input, &mut buf).unwrap() {
+            Encoded::Linear { len, .. } => len,
+            _ => panic!("expected linear"),
+        }
+    }
+
     #[test]
     fn test_encode_basic() {
-        let out = Code39::encode("CODE39").unwrap();
-        assert!(matches!(out, BarcodeOutput::Linear(_)));
+        assert!(encode_len("CODE39") > 0);
     }
 
     #[test]
     fn test_encode_digits() {
-        let out = Code39::encode("12345").unwrap();
-        assert!(matches!(out, BarcodeOutput::Linear(_)));
+        assert!(encode_len("12345") > 0);
     }
 
     #[test]
     fn test_encode_special_chars() {
-        let out = Code39::encode("HELLO WORLD").unwrap();
-        assert!(matches!(out, BarcodeOutput::Linear(_)));
+        assert!(encode_len("HELLO WORLD") > 0);
     }
 
     #[test]
     fn test_invalid_character() {
         // Lowercase is not valid in Code 39
-        assert!(Code39::encode("hello").is_err());
+        let mut buf = [false; 1024];
+        assert!(Code39::encode_into("hello", &mut buf).is_err());
     }
 
     #[test]
     fn test_invalid_char_symbol() {
-        assert!(Code39::encode("ABC!DEF").is_err());
+        let mut buf = [false; 1024];
+        assert!(Code39::encode_into("ABC!DEF", &mut buf).is_err());
     }
 
     #[test]
     fn test_empty_input() {
-        assert!(Code39::encode("").is_err());
+        let mut buf = [false; 1024];
+        assert!(Code39::encode_into("", &mut buf).is_err());
+    }
+
+    #[test]
+    fn test_buffer_too_small() {
+        let mut buf = [false; 8];
+        assert_eq!(
+            Code39::encode_into("A", &mut buf),
+            Err(EncodeError::BufferTooSmall)
+        );
     }
 
     #[test]
@@ -353,21 +353,13 @@ mod tests {
     #[test]
     fn test_bar_count_single_char() {
         // Single char 'A': start(*) + gap + A + gap + stop(*)
-        // * pattern: all narrow = 9 modules  (1+1+1+1+1+1+1+1+1 = 9... actually mix)
-        // Let's just verify it produces output with reasonable length
-        let out = Code39::encode("A").unwrap();
-        match out {
-            BarcodeOutput::Linear(lb) => {
-                // Start * + gap(1) + A + gap(1) + Stop *
-                // * = N W N N W N W N N = 1+3+1+1+3+1+3+1+1 = 15
-                // A = W N N N N N W N W = 3+1+1+1+1+1+3+1+3 = 15
-                // Total = 15 + 1 + 15 + 1 + 15 = 47
-                assert_eq!(lb.bars.len(), 47);
-            }
-            _ => panic!("expected linear"),
-        }
+        // * = N W N N W N W N N = 1+3+1+1+3+1+3+1+1 = 15
+        // A = W N N N N N W N W = 3+1+1+1+1+1+3+1+3 = 15
+        // Total = 15 + 1 + 15 + 1 + 15 = 47
+        assert_eq!(encode_len("A"), 47);
     }
 
+    #[cfg(feature = "alloc")]
     #[test]
     fn test_svg_output() {
         let svg = Code39::encode("TEST").unwrap().to_svg_string();

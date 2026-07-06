@@ -1,188 +1,257 @@
-//! GS1 DataBar Omnidirectional barcode encoder.
+//! GS1 DataBar Omnidirectional (RSS-14) barcode encoder.
 //!
-//! GS1 DataBar Omnidirectional encodes a 14-digit GTIN (Global Trade Item
-//! Number).  It consists of two halves separated by a finder pattern.
-//!
-//! This implementation provides GTIN validation, check digit computation, and
-//! a simplified encoding of the DataBar structure.
+//! Encodes a 13- or 14-digit GTIN into the 96-module GS1 DataBar
+//! Omnidirectional linear pattern (ISO/IEC 24724).  The element-width
+//! generation follows the standard combinatorial algorithm, so the symbol
+//! decodes on conforming readers.
 #![forbid(unsafe_code)]
 
-extern crate alloc;
-use alloc::{format, string::String, vec::Vec};
-
 use crate::common::{
-    errors::EncodeError,
-    traits::BarcodeEncoder,
-    types::{BarcodeOutput, LinearBarcode},
+    buffer::SliceWriter, errors::EncodeError, traits::BarcodeEncoder, types::Encoded,
 };
 
-// ---- DataBar character set tables ------------------------------------------
+// ---- Tables (ISO/IEC 24724, via zint) --------------------------------------
 
-/// GS1 DataBar uses the RSS-14 character set.
-/// Each character consists of 4 elements with a total width of 15 modules.
-/// The table maps symbol values (0-115) to their element widths.
-///
-/// For simplicity, we encode each character as a sequence of bar/space widths.
-/// This implementation provides the structure but uses a simplified encoding.
-///
-/// Finder pattern for DataBar Omnidirectional: 3 1 1 1 1 3
-const FINDER_PATTERN: [u8; 6] = [3, 1, 1, 1, 1, 3]; // 10 modules
-
-/// DataBar character widths. Each character has 4 elements summing to 15.
-/// Table from GS1 DataBar specification (subset of RSS-14).
-///
-/// Index = character value (0-115), value = [w1, w2, w3, w4] widths.
-/// Characters are encoded as: bar, space, bar, space (alternating).
-const DATABAR_TABLE: &[[u8; 4]] = &[
-    [1, 1, 1, 12], // 0
-    [1, 1, 2, 11], // 1
-    [1, 1, 3, 10], // 2
-    [1, 1, 4, 9],  // 3
-    [1, 1, 5, 8],  // 4
-    [1, 1, 6, 7],  // 5
-    [1, 1, 7, 6],  // 6
-    [1, 1, 8, 5],  // 7
-    [1, 1, 9, 4],  // 8
-    [1, 1, 10, 3], // 9
-    [1, 1, 11, 2], // 10
-    [1, 1, 12, 1], // 11
-    [1, 2, 1, 11], // 12
-    [1, 2, 2, 10], // 13
-    [1, 2, 3, 9],  // 14
-    [1, 2, 4, 8],  // 15
-    [1, 2, 5, 7],  // 16
-    [1, 2, 6, 6],  // 17
-    [1, 2, 7, 5],  // 18
-    [1, 2, 8, 4],  // 19
-    [1, 2, 9, 3],  // 20
-    [1, 2, 10, 2], // 21
-    [1, 2, 11, 1], // 22
-    [1, 3, 1, 10], // 23
-    [1, 3, 2, 9],  // 24
-    [1, 3, 3, 8],  // 25
-    [1, 3, 4, 7],  // 26
-    [1, 3, 5, 6],  // 27
-    [1, 3, 6, 5],  // 28
-    [1, 3, 7, 4],  // 29
-    [1, 3, 8, 3],  // 30
-    [1, 3, 9, 2],  // 31
-    [1, 3, 10, 1], // 32
-    [1, 4, 1, 9],  // 33
-    [1, 4, 2, 8],  // 34
-    [1, 4, 3, 7],  // 35
-    [1, 4, 4, 6],  // 36
-    [1, 4, 5, 5],  // 37
-    [1, 4, 6, 4],  // 38
-    [1, 4, 7, 3],  // 39
-    [1, 4, 8, 2],  // 40
-    [1, 4, 9, 1],  // 41
-    [1, 5, 1, 8],  // 42
-    [1, 5, 2, 7],  // 43
-    [1, 5, 3, 6],  // 44
-    [1, 5, 4, 5],  // 45
-    [1, 5, 5, 4],  // 46
-    [1, 5, 6, 3],  // 47
-    [1, 5, 7, 2],  // 48
-    [1, 5, 8, 1],  // 49
-    [1, 6, 1, 7],  // 50
-    [1, 6, 2, 6],  // 51
-    [1, 6, 3, 5],  // 52
-    [1, 6, 4, 4],  // 53
-    [1, 6, 5, 3],  // 54
-    [1, 6, 6, 2],  // 55
-    [1, 6, 7, 1],  // 56
-    [1, 7, 1, 6],  // 57
-    [1, 7, 2, 5],  // 58
-    [1, 7, 3, 4],  // 59
-    [1, 7, 4, 3],  // 60
-    [1, 7, 5, 2],  // 61
-    [1, 7, 6, 1],  // 62
-    [1, 8, 1, 5],  // 63
-    [1, 8, 2, 4],  // 64
-    [1, 8, 3, 3],  // 65
-    [1, 8, 4, 2],  // 66
-    [1, 8, 5, 1],  // 67
-    [1, 9, 1, 4],  // 68
-    [1, 9, 2, 3],  // 69
-    [1, 9, 3, 2],  // 70
-    [1, 9, 4, 1],  // 71
-    [1, 10, 1, 3], // 72
-    [1, 10, 2, 2], // 73
-    [1, 10, 3, 1], // 74
-    [1, 11, 1, 2], // 75
-    [1, 11, 2, 1], // 76
-    [1, 12, 1, 1], // 77
-    [2, 1, 1, 11], // 78
-    [2, 1, 2, 10], // 79
-    [2, 1, 3, 9],  // 80
-    [2, 1, 4, 8],  // 81
-    [2, 1, 5, 7],  // 82
-    [2, 1, 6, 6],  // 83
-    [2, 1, 7, 5],  // 84
-    [2, 1, 8, 4],  // 85
-    [2, 1, 9, 3],  // 86
-    [2, 1, 10, 2], // 87
-    [2, 1, 11, 1], // 88
-    [2, 2, 1, 10], // 89
-    [2, 2, 2, 9],  // 90
-    [2, 2, 3, 8],  // 91
-    [2, 2, 4, 7],  // 92
-    [2, 2, 5, 6],  // 93
-    [2, 2, 6, 5],  // 94
-    [2, 2, 7, 4],  // 95
-    [2, 2, 8, 3],  // 96
-    [2, 2, 9, 2],  // 97
-    [2, 2, 10, 1], // 98
-    [2, 3, 1, 9],  // 99
-    [2, 3, 2, 8],  // 100
-    [2, 3, 3, 7],  // 101
-    [2, 3, 4, 6],  // 102
-    [2, 3, 5, 5],  // 103
-    [2, 3, 6, 4],  // 104
-    [2, 3, 7, 3],  // 105
-    [2, 3, 8, 2],  // 106
-    [2, 3, 9, 1],  // 107
-    [2, 4, 1, 8],  // 108
-    [2, 4, 2, 7],  // 109
-    [2, 4, 3, 6],  // 110
-    [2, 4, 4, 5],  // 111
-    [2, 4, 5, 4],  // 112
-    [2, 4, 6, 3],  // 113
-    [2, 4, 7, 2],  // 114
-    [2, 4, 8, 1],  // 115
+/// Combinations table `C(n, r)` for n = 0..17, r = 0..5.
+const COMBINS: [[u16; 6]; 18] = [
+    [1, 1, 1, 1, 1, 1],
+    [1, 1, 1, 1, 1, 1],
+    [1, 2, 1, 1, 1, 1],
+    [1, 3, 3, 1, 1, 1],
+    [1, 4, 6, 4, 1, 1],
+    [1, 5, 10, 10, 5, 1],
+    [1, 6, 15, 20, 15, 6],
+    [1, 7, 21, 35, 35, 21],
+    [1, 8, 28, 56, 70, 56],
+    [1, 9, 36, 84, 126, 126],
+    [1, 10, 45, 120, 210, 252],
+    [1, 11, 55, 165, 330, 462],
+    [1, 12, 66, 220, 495, 792],
+    [1, 13, 78, 286, 715, 1287],
+    [1, 14, 91, 364, 1001, 2002],
+    [1, 15, 105, 455, 1365, 3003],
+    [1, 16, 120, 560, 1820, 4368],
+    [1, 17, 136, 680, 2380, 6188],
 ];
+
+/// Group value sums: outside groups 0..4, inside groups 5..8.
+const G_SUM: [i32; 9] = [0, 161, 961, 2015, 2715, 0, 336, 1036, 1516];
+/// t-values (even for outside, odd for inside).
+const T_EVEN_ODD: [i32; 9] = [1, 10, 34, 70, 126, 4, 20, 48, 81];
+/// Module counts: outside odd, inside odd, outside even, inside even.
+const MODULES: [i32; 18] = [12, 10, 8, 6, 4, 5, 7, 9, 11, 4, 6, 8, 10, 12, 10, 8, 6, 4];
+/// Widest odd element per group.
+const WIDEST: [i32; 9] = [8, 6, 4, 3, 1, 2, 4, 6, 8];
+/// Checksum weights.
+const CHECKSUM_WEIGHT: [[i32; 8]; 4] = [
+    [1, 3, 9, 27, 2, 6, 18, 54],
+    [4, 12, 36, 29, 8, 24, 72, 58],
+    [16, 48, 65, 37, 32, 17, 51, 74],
+    [64, 34, 23, 69, 49, 68, 46, 59],
+];
+/// Finder patterns (5 elements each, 9 patterns).
+const FINDER: [[i32; 5]; 9] = [
+    [3, 8, 2, 1, 1],
+    [3, 5, 5, 1, 1],
+    [3, 3, 7, 1, 1],
+    [3, 1, 9, 1, 1],
+    [2, 7, 4, 1, 1],
+    [2, 5, 6, 1, 1],
+    [2, 3, 8, 1, 1],
+    [1, 5, 7, 1, 1],
+    [1, 3, 9, 1, 1],
+];
+
+// ---- Element-width generation ----------------------------------------------
+
+#[inline]
+fn combins(n: i32, r: i32) -> i32 {
+    if !(0..18).contains(&n) || !(0..6).contains(&r) {
+        return 0;
+    }
+    COMBINS[n as usize][r as usize] as i32
+}
+
+/// Generate 4 element widths for `val` (ISO/IEC 24724 Annex B).
+fn get_widths(widths: &mut [i32; 4], mut val: i32, mut n: i32, max_width: i32, no_narrow: bool) {
+    const ELEMENTS: i32 = 4;
+    let mut narrow_mask = 0i32;
+    let mut bar = 0;
+    while bar < ELEMENTS - 1 {
+        let mut elm_width = 1;
+        narrow_mask |= 1 << bar;
+        let mut sub_val;
+        loop {
+            sub_val = combins(n - elm_width - 1, ELEMENTS - bar - 2);
+            if no_narrow
+                && narrow_mask == 0
+                && n - elm_width - (ELEMENTS - bar - 1) >= ELEMENTS - bar - 1
+            {
+                sub_val -= combins(n - elm_width - (ELEMENTS - bar), ELEMENTS - bar - 2);
+            }
+            if ELEMENTS - bar - 1 > 1 {
+                let mut less_val = 0;
+                let mut mxw = n - elm_width - (ELEMENTS - bar - 2);
+                while mxw > max_width {
+                    less_val += combins(n - elm_width - mxw - 1, ELEMENTS - bar - 3);
+                    mxw -= 1;
+                }
+                sub_val -= less_val * (ELEMENTS - 1 - bar);
+            } else if n - elm_width > max_width {
+                sub_val -= 1;
+            }
+            val -= sub_val;
+            if val < 0 {
+                break;
+            }
+            elm_width += 1;
+            narrow_mask &= !(1 << bar);
+        }
+        val += sub_val;
+        n -= elm_width;
+        widths[bar as usize] = elm_width;
+        bar += 1;
+    }
+    widths[bar as usize] = n;
+}
+
+/// Interleave odd/even element widths into `ret` (8 elements).
+fn interleave(
+    ret: &mut [i32; 8],
+    v_odd: i32,
+    v_even: i32,
+    n_odd: i32,
+    n_even: i32,
+    max_width: i32,
+    no_narrow: bool,
+) {
+    let mut odd = [0i32; 4];
+    let mut even = [0i32; 4];
+    get_widths(&mut odd, v_odd, n_odd, max_width, no_narrow);
+    get_widths(&mut even, v_even, n_even, 9 - max_width, !no_narrow);
+    for i in 0..4 {
+        ret[i << 1] = odd[i];
+        ret[(i << 1) + 1] = even[i];
+    }
+}
+
+/// Determine the group index for a data-character value.
+fn group(val: i32, outside: bool) -> usize {
+    let end = 8 >> (outside as i32);
+    let mut i = if outside { 0 } else { 5 };
+    while i < end {
+        if val < G_SUM[(i + 1) as usize] {
+            return i as usize;
+        }
+        i += 1;
+    }
+    i as usize
+}
 
 // ---- Public encoder --------------------------------------------------------
 
-/// GS1 DataBar Omnidirectional barcode encoder.
-///
-/// Encodes a 13 or 14-digit GTIN.  If 13 digits are provided, the check digit
-/// is computed automatically.
+/// GS1 DataBar Omnidirectional (RSS-14) encoder.
 ///
 /// # Example
 ///
 /// ```rust
 /// use barcodes::common::traits::BarcodeEncoder;
+/// use barcodes::common::types::Encoded;
 /// use barcodes::gs1::databar::DataBar;
 ///
-/// let out = DataBar::encode("0614141123452").unwrap();
+/// let mut buf = [false; 128];
+/// let Encoded::Linear { len, .. } = DataBar::encode_into("2001234567890", &mut buf).unwrap()
+/// else { unreachable!() };
+/// assert_eq!(len, 96);
 /// ```
 pub struct DataBar;
 
 impl BarcodeEncoder for DataBar {
     type Input = str;
-    type Error = EncodeError;
 
-    fn encode(input: &str) -> Result<BarcodeOutput, EncodeError> {
-        let digits = parse_and_validate(input)?;
-        let bars = encode_bars(&digits);
-        let text = format_text(&digits);
+    fn encode_into(input: &str, buf: &mut [bool]) -> Result<Encoded, EncodeError> {
+        let val = parse(input)?;
 
-        Ok(BarcodeOutput::Linear(LinearBarcode {
-            bars,
+        // Left/right pair and four data characters.
+        let left_pair = (val / 4_537_077) as i32;
+        let right_pair = (val % 4_537_077) as i32;
+        let data_char = [
+            left_pair / 1597,
+            left_pair % 1597,
+            right_pair / 1597,
+            right_pair % 1597,
+        ];
+
+        // Element widths for each data character.
+        let mut data_widths = [[0i32; 8]; 4];
+        for i in 0..4 {
+            let outside = i % 2 == 0;
+            let g = group(data_char[i], outside);
+            let v = data_char[i] - G_SUM[g];
+            let v_div = v / T_EVEN_ODD[g];
+            let v_mod = v % T_EVEN_ODD[g];
+            let (v_odd, v_even) = if outside {
+                (v_div, v_mod)
+            } else {
+                (v_mod, v_div)
+            };
+            interleave(
+                &mut data_widths[i],
+                v_odd,
+                v_even,
+                MODULES[g],
+                MODULES[g + 9],
+                WIDEST[g],
+                !outside,
+            );
+        }
+
+        // Checksum → two check characters selecting the finder patterns.
+        let mut checksum = 0;
+        for i in 0..4 {
+            for j in 0..8 {
+                checksum += CHECKSUM_WEIGHT[i][j] * data_widths[i][j];
+            }
+        }
+        checksum %= 79;
+        if checksum >= 8 {
+            checksum += 1;
+        }
+        if checksum >= 72 {
+            checksum += 1;
+        }
+        let c_left = (checksum / 9) as usize;
+        let c_right = (checksum % 9) as usize;
+
+        // Assemble the 46 element widths (guards, data, finders).
+        let mut tw = [0i32; 46];
+        tw[0] = 1;
+        tw[1] = 1;
+        tw[44] = 1;
+        tw[45] = 1;
+        for i in 0..8 {
+            tw[i + 2] = data_widths[0][i];
+            tw[i + 15] = data_widths[1][7 - i];
+            tw[i + 23] = data_widths[3][i];
+            tw[i + 36] = data_widths[2][7 - i];
+        }
+        for i in 0..5 {
+            tw[i + 10] = FINDER[c_left][i];
+            tw[i + 31] = FINDER[c_right][4 - i];
+        }
+
+        // Render: alternate light/dark starting with light (96 modules).
+        let mut w = SliceWriter::new(buf);
+        let mut dark = false;
+        for &width in &tw {
+            w.push_run(dark, width as usize)?;
+            dark = !dark;
+        }
+
+        Ok(Encoded::Linear {
+            len: w.len(),
             height: 33,
-            text: Some(text),
-        }))
+        })
     }
 
     fn symbology_name() -> &'static str {
@@ -192,147 +261,46 @@ impl BarcodeEncoder for DataBar {
 
 // ---- Helpers ---------------------------------------------------------------
 
-fn parse_and_validate(input: &str) -> Result<[u8; 14], EncodeError> {
-    let trimmed = input.trim();
-    if !trimmed.chars().all(|c| c.is_ascii_digit()) {
-        return Err(EncodeError::InvalidInput(
-            "GS1 DataBar input must contain digits only".into(),
-        ));
+/// GS1 mod-10 check digit over `digits` (weights 3,1,3,1,… from the right).
+fn gs1_check_digit(digits: &[u8]) -> u8 {
+    let mut sum = 0u32;
+    for (i, &d) in digits.iter().rev().enumerate() {
+        sum += d as u32 * if i % 2 == 0 { 3 } else { 1 };
     }
-
-    match trimmed.len() {
-        13 => {
-            let mut digits = [0u8; 14];
-            // Pad with leading zero
-            digits[0] = 0;
-            for (i, c) in trimmed.chars().enumerate() {
-                digits[i + 1] = c as u8 - b'0';
-            }
-            // Recompute check digit for 14-digit GTIN
-            digits[13] = gtin_check_digit(&digits[..13]);
-            Ok(digits)
-        }
-        14 => {
-            let mut digits = [0u8; 14];
-            for (i, c) in trimmed.chars().enumerate() {
-                digits[i] = c as u8 - b'0';
-            }
-            let expected = gtin_check_digit(&digits[..13]);
-            if digits[13] != expected {
-                return Err(EncodeError::InvalidInput(format!(
-                    "GTIN check digit mismatch: got {}, expected {expected}",
-                    digits[13]
-                )));
-            }
-            Ok(digits)
-        }
-        _ => Err(EncodeError::InvalidInput(
-            "GS1 DataBar input must be 13 or 14 digits".into(),
-        )),
-    }
-}
-
-/// Compute GS1 GTIN-14 check digit using the standard GS1 algorithm.
-pub(crate) fn gtin_check_digit(digits: &[u8]) -> u8 {
-    let sum: u32 = digits
-        .iter()
-        .enumerate()
-        .map(|(i, &d)| {
-            // From right to left (excluding check): odd positions ×3, even ×1
-            // digits has 13 elements; last is position 0 from right
-            let from_right = digits.len() - i; // 13 down to 1
-            let weight = if from_right.is_multiple_of(2) {
-                1u32
-            } else {
-                3u32
-            };
-            weight * d as u32
-        })
-        .sum();
     ((10 - (sum % 10)) % 10) as u8
 }
 
-/// Encode the DataBar barcode.
-///
-/// DataBar Omnidirectional structure:
-/// - Left guard (1 module dark)
-/// - Left pair: left character + finder + right character  
-/// - Separator (dark)
-/// - Right pair: left character + finder + right character
-/// - Right guard (1 module dark)
-fn encode_bars(digits: &[u8; 14]) -> Vec<bool> {
-    // Compute the numerical value of the GTIN
-    let mut value: u64 = 0;
-    for &d in digits.iter() {
-        value = value * 10 + d as u64;
+/// Parse the input into the 13-digit numeric value that RSS-14 encodes.
+fn parse(input: &str) -> Result<u64, EncodeError> {
+    let t = input.trim();
+    if !t.chars().all(|c| c.is_ascii_digit()) {
+        return Err(EncodeError::InvalidInput(
+            "GS1 DataBar input must contain digits only",
+        ));
     }
-
-    // DataBar encodes the GTIN as two halves
-    // Left half = value / 4537077, right half = value % 4537077
-    let left_value = value / 4_537_077;
-    let right_value = value % 4_537_077;
-
-    let mut bars: Vec<bool> = Vec::new();
-
-    // Encode left half
-    encode_half(&mut bars, left_value, true);
-
-    // Separator (1 narrow space)
-    bars.push(false);
-
-    // Encode right half
-    encode_half(&mut bars, right_value, false);
-
-    bars
-}
-
-/// Encode one half of a DataBar Omnidirectional symbol.
-fn encode_half(bars: &mut Vec<bool>, value: u64, is_left: bool) {
-    // Left guard: 1 dark bar
-    if is_left {
-        bars.push(true);
-    }
-
-    // Compute character values from GTIN half value
-    // Each half has 2 data characters + finder pattern
-    let char_a = (value / 1349) as usize % 116;
-    let char_b = (value % 1349) as usize;
-    let char_b = if char_b >= 116 { 115 } else { char_b };
-
-    // Encode character A
-    encode_databar_char(bars, char_a, true);
-
-    // Finder pattern
-    let mut dark = false;
-    for &w in &FINDER_PATTERN {
-        for _ in 0..w {
-            bars.push(dark);
+    let bytes = t.as_bytes();
+    let digits13: &[u8] = match bytes.len() {
+        13 => bytes,
+        14 => {
+            let d: [u8; 14] = core::array::from_fn(|i| bytes[i] - b'0');
+            if gs1_check_digit(&d[..13]) != d[13] {
+                return Err(EncodeError::InvalidInput(
+                    "GS1 DataBar check digit mismatch",
+                ));
+            }
+            &bytes[..13]
         }
-        dark = !dark;
-    }
-
-    // Encode character B
-    encode_databar_char(bars, char_b, false);
-
-    // Right guard: 1 dark bar
-    if !is_left {
-        bars.push(true);
-    }
-}
-
-fn encode_databar_char(bars: &mut Vec<bool>, idx: usize, start_dark: bool) {
-    let pattern = &DATABAR_TABLE[idx.min(DATABAR_TABLE.len() - 1)];
-    let mut dark = start_dark;
-    for &w in pattern.iter() {
-        for _ in 0..w {
-            bars.push(dark);
+        _ => {
+            return Err(EncodeError::InvalidInput(
+                "GS1 DataBar input must be 13 or 14 digits",
+            ));
         }
-        dark = !dark;
+    };
+    let mut val = 0u64;
+    for &b in digits13 {
+        val = val * 10 + (b - b'0') as u64;
     }
-}
-
-fn format_text(digits: &[u8; 14]) -> String {
-    digits.iter().map(|d| (b'0' + d) as char).collect()
+    Ok(val)
 }
 
 // ---- Tests -----------------------------------------------------------------
@@ -341,38 +309,29 @@ fn format_text(digits: &[u8; 14]) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_gtin_check_digit() {
-        // Known GTIN-14: 00614141123452
-        let digits: [u8; 13] = [0, 0, 6, 1, 4, 1, 4, 1, 1, 2, 3, 4, 5];
-        assert_eq!(gtin_check_digit(&digits), 2);
+    fn encode_len(input: &str) -> usize {
+        let mut buf = [false; 128];
+        match DataBar::encode_into(input, &mut buf).unwrap() {
+            Encoded::Linear { len, .. } => len,
+            _ => panic!("expected linear"),
+        }
     }
 
     #[test]
-    fn test_encode_14_digits() {
-        let out = DataBar::encode("00614141123452").unwrap();
-        assert!(matches!(out, BarcodeOutput::Linear(_)));
-    }
-
-    #[test]
-    fn test_encode_13_digits_auto_check() {
-        let out = DataBar::encode("0061414112345").unwrap();
-        assert!(matches!(out, BarcodeOutput::Linear(_)));
-    }
-
-    #[test]
-    fn test_invalid_check_digit() {
-        assert!(DataBar::encode("00614141123453").is_err());
+    fn test_encode_13_digits() {
+        assert_eq!(encode_len("2001234567890"), 96);
     }
 
     #[test]
     fn test_invalid_chars() {
-        assert!(DataBar::encode("0061414112345X").is_err());
+        let mut buf = [false; 128];
+        assert!(DataBar::encode_into("200123456789X", &mut buf).is_err());
     }
 
     #[test]
     fn test_wrong_length() {
-        assert!(DataBar::encode("0061414").is_err());
+        let mut buf = [false; 128];
+        assert!(DataBar::encode_into("12345", &mut buf).is_err());
     }
 
     #[test]
@@ -380,9 +339,10 @@ mod tests {
         assert_eq!(DataBar::symbology_name(), "GS1 DataBar");
     }
 
+    #[cfg(feature = "alloc")]
     #[test]
     fn test_svg_output() {
-        let svg = DataBar::encode("00614141123452").unwrap().to_svg_string();
+        let svg = DataBar::encode("2001234567890").unwrap().to_svg_string();
         assert!(svg.starts_with("<svg "));
     }
 }

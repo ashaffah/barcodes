@@ -10,14 +10,12 @@
 //! appended automatically after the data.
 #![forbid(unsafe_code)]
 
-extern crate alloc;
-use alloc::vec::Vec;
-
 use crate::common::{
-    errors::EncodeError,
-    traits::BarcodeEncoder,
-    types::{BarcodeOutput, LinearBarcode},
+    buffer::SliceWriter, errors::EncodeError, traits::BarcodeEncoder, types::Encoded,
 };
+
+/// Maximum number of data characters supported in a single symbol.
+const MAX_DATA: usize = 256;
 
 // ---- Encoding table --------------------------------------------------------
 
@@ -96,49 +94,46 @@ const START_STOP: usize = 47;
 ///
 /// ```rust
 /// use barcodes::common::traits::BarcodeEncoder;
+/// use barcodes::common::types::Encoded;
 /// use barcodes::linear::code93::Code93;
 ///
-/// let out = Code93::encode("CODE93").unwrap();
+/// let mut buf = [false; 256];
+/// let Encoded::Linear { len, .. } = Code93::encode_into("CODE93", &mut buf).unwrap()
+/// else { unreachable!() };
+/// let bars = &buf[..len];
 /// ```
 pub struct Code93;
 
 impl BarcodeEncoder for Code93 {
     type Input = str;
-    type Error = EncodeError;
 
-    fn encode(input: &str) -> Result<BarcodeOutput, EncodeError> {
+    fn encode_into(input: &str, buf: &mut [bool]) -> Result<Encoded, EncodeError> {
         if input.is_empty() {
-            return Err(EncodeError::InvalidInput(
-                "Code 93 input must not be empty".into(),
-            ));
+            return Err(EncodeError::InvalidInput("Code 93 input must not be empty"));
         }
 
-        // Map each character to its value, rejecting anything unsupported.
-        let mut values: Vec<usize> = Vec::with_capacity(input.len());
+        // Map each character to its value in a fixed stack buffer (+2 for C, K).
+        let mut values = [0usize; MAX_DATA + 2];
+        let mut n = 0;
         for ch in input.chars() {
-            match char_value(ch) {
-                Some(v) => values.push(v),
-                None => {
-                    return Err(EncodeError::InvalidInput(alloc::format!(
-                        "character '{ch}' is not valid in Code 93"
-                    )));
-                }
+            let v = char_value(ch).ok_or(EncodeError::InvalidCharacter(ch))?;
+            if n >= MAX_DATA {
+                return Err(EncodeError::DataTooLong);
             }
+            values[n] = v;
+            n += 1;
         }
 
         // Append the two check characters (C then K).
-        let c = check_value(&values, 20);
-        values.push(c);
-        let k = check_value(&values, 15);
-        values.push(k);
+        let c = check_value(&values[..n], 20);
+        values[n] = c;
+        n += 1;
+        let k = check_value(&values[..n], 15);
+        values[n] = k;
+        n += 1;
 
-        let bars = encode_bars(&values);
-
-        Ok(BarcodeOutput::Linear(LinearBarcode {
-            bars,
-            height: 50,
-            text: Some(input.into()),
-        }))
+        let len = encode_bars(&values[..n], buf)?;
+        Ok(Encoded::Linear { len, height: 50 })
     }
 
     fn symbology_name() -> &'static str {
@@ -168,28 +163,29 @@ fn check_value(values: &[usize], max_weight: u32) -> usize {
     (sum % 47) as usize
 }
 
-/// Append a character's 9-module pattern to `bars`.
-fn append_pattern(bars: &mut Vec<bool>, value: usize) {
+/// Append a character's 9-module pattern to the writer.
+fn append_pattern(w: &mut SliceWriter, value: usize) -> Result<(), EncodeError> {
     let pattern = CODE93_PATTERNS[value];
     for i in (0..9).rev() {
-        bars.push((pattern >> i) & 1 == 1);
+        w.push((pattern >> i) & 1 == 1)?;
     }
+    Ok(())
 }
 
-fn encode_bars(values: &[usize]) -> Vec<bool> {
-    // start + data/check chars + stop, 9 modules each, plus a termination bar.
-    let mut bars: Vec<bool> = Vec::with_capacity((values.len() + 2) * 9 + 1);
+/// Write start + data/check chars + stop + termination bar; return module count.
+fn encode_bars(values: &[usize], buf: &mut [bool]) -> Result<usize, EncodeError> {
+    let mut w = SliceWriter::new(buf);
 
-    append_pattern(&mut bars, START_STOP);
+    append_pattern(&mut w, START_STOP)?;
     for &v in values {
-        append_pattern(&mut bars, v);
+        append_pattern(&mut w, v)?;
     }
-    append_pattern(&mut bars, START_STOP);
+    append_pattern(&mut w, START_STOP)?;
 
     // Final termination bar (single dark module).
-    bars.push(true);
+    w.push(true)?;
 
-    bars
+    Ok(w.len())
 }
 
 // ---- Tests -----------------------------------------------------------------
@@ -198,31 +194,49 @@ fn encode_bars(values: &[usize]) -> Vec<bool> {
 mod tests {
     use super::*;
 
+    fn encode_len(input: &str) -> usize {
+        let mut buf = [false; 4096];
+        match Code93::encode_into(input, &mut buf).unwrap() {
+            Encoded::Linear { len, .. } => len,
+            _ => panic!("expected linear"),
+        }
+    }
+
     #[test]
     fn test_encode_basic() {
-        let out = Code93::encode("CODE93").unwrap();
-        assert!(matches!(out, BarcodeOutput::Linear(_)));
+        assert!(encode_len("CODE93") > 0);
     }
 
     #[test]
     fn test_encode_special_chars() {
-        let out = Code93::encode("HELLO WORLD").unwrap();
-        assert!(matches!(out, BarcodeOutput::Linear(_)));
+        assert!(encode_len("HELLO WORLD") > 0);
     }
 
     #[test]
     fn test_invalid_lowercase() {
-        assert!(Code93::encode("hello").is_err());
+        let mut buf = [false; 4096];
+        assert!(Code93::encode_into("hello", &mut buf).is_err());
     }
 
     #[test]
     fn test_invalid_symbol() {
-        assert!(Code93::encode("ABC!DEF").is_err());
+        let mut buf = [false; 4096];
+        assert!(Code93::encode_into("ABC!DEF", &mut buf).is_err());
     }
 
     #[test]
     fn test_empty_input() {
-        assert!(Code93::encode("").is_err());
+        let mut buf = [false; 4096];
+        assert!(Code93::encode_into("", &mut buf).is_err());
+    }
+
+    #[test]
+    fn test_buffer_too_small() {
+        let mut buf = [false; 4];
+        assert_eq!(
+            Code93::encode_into("CODE93", &mut buf),
+            Err(EncodeError::BufferTooSmall)
+        );
     }
 
     #[test]
@@ -233,25 +247,27 @@ mod tests {
     #[test]
     fn test_bar_count() {
         // "A": start + A + C + K + stop = 5 chars * 9 modules + 1 termination.
-        let out = Code93::encode("A").unwrap();
-        match out {
-            BarcodeOutput::Linear(lb) => assert_eq!(lb.bars.len(), 5 * 9 + 1),
-            _ => panic!("expected linear"),
-        }
+        assert_eq!(encode_len("A"), 5 * 9 + 1);
     }
 
     #[test]
     fn test_check_values_known() {
         // Worked example: "CODE93" -> C check char 'P' (25), K check char 'V' (31).
-        let values: Vec<usize> = "CODE93".chars().map(|c| char_value(c).unwrap()).collect();
-        let c = check_value(&values, 20);
+        let mut values = [0usize; 8];
+        let mut n = 0;
+        for ch in "CODE93".chars() {
+            values[n] = char_value(ch).unwrap();
+            n += 1;
+        }
+        let c = check_value(&values[..n], 20);
         assert_eq!(c, char_value('P').unwrap());
-        let mut with_c = values.clone();
-        with_c.push(c);
-        let k = check_value(&with_c, 15);
+        values[n] = c;
+        n += 1;
+        let k = check_value(&values[..n], 15);
         assert_eq!(k, char_value('V').unwrap());
     }
 
+    #[cfg(feature = "alloc")]
     #[test]
     fn test_svg_output() {
         let svg = Code93::encode("TEST").unwrap().to_svg_string();

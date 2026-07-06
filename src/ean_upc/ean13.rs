@@ -13,13 +13,8 @@
 //! selects the L/G parity pattern for the left-hand six digits.
 #![forbid(unsafe_code)]
 
-extern crate alloc;
-use alloc::{format, string::String, vec::Vec};
-
 use crate::common::{
-    errors::EncodeError,
-    traits::BarcodeEncoder,
-    types::{BarcodeOutput, LinearBarcode},
+    buffer::SliceWriter, errors::EncodeError, traits::BarcodeEncoder, types::Encoded,
 };
 
 // ---- Encoding tables -------------------------------------------------------
@@ -99,29 +94,24 @@ pub(crate) const GUARD_CENTRE: [bool; 5] = [false, true, false, true, false];
 ///
 /// ```rust
 /// use barcodes::common::traits::BarcodeEncoder;
+/// use barcodes::common::types::Encoded;
 /// use barcodes::ean_upc::ean13::Ean13;
 ///
-/// // 13 digits — check digit must be correct
-/// let out = Ean13::encode("5901234123457").unwrap();
-///
+/// let mut buf = [false; 128];
 /// // 12 digits — check digit appended automatically
-/// let out2 = Ean13::encode("590123412345").unwrap();
+/// let Encoded::Linear { len, .. } = Ean13::encode_into("590123412345", &mut buf).unwrap()
+/// else { unreachable!() };
+/// assert_eq!(len, 95);
 /// ```
 pub struct Ean13;
 
 impl BarcodeEncoder for Ean13 {
     type Input = str;
-    type Error = EncodeError;
 
-    fn encode(input: &str) -> Result<BarcodeOutput, EncodeError> {
+    fn encode_into(input: &str, buf: &mut [bool]) -> Result<Encoded, EncodeError> {
         let digits = parse_and_validate(input)?;
-        let bars = encode_bars(&digits);
-
-        Ok(BarcodeOutput::Linear(LinearBarcode {
-            bars,
-            height: 69,
-            text: Some(format_text(&digits)),
-        }))
+        let len = encode_bars(&digits, buf)?;
+        Ok(Encoded::Linear { len, height: 69 })
     }
 
     fn symbology_name() -> &'static str {
@@ -135,7 +125,7 @@ fn parse_and_validate(input: &str) -> Result<[u8; 13], EncodeError> {
     let trimmed = input.trim();
     if !trimmed.chars().all(|c| c.is_ascii_digit()) {
         return Err(EncodeError::InvalidInput(
-            "EAN-13 input must contain digits only".into(),
+            "EAN-13 input must contain digits only",
         ));
     }
     match trimmed.len() {
@@ -154,20 +144,17 @@ fn parse_and_validate(input: &str) -> Result<[u8; 13], EncodeError> {
             }
             let expected = check_digit(&digits[..12]);
             if digits[12] != expected {
-                return Err(EncodeError::InvalidInput(format!(
-                    "check digit mismatch: got {}, expected {expected}",
-                    digits[12]
-                )));
+                return Err(EncodeError::InvalidInput("EAN-13 check digit mismatch"));
             }
             Ok(digits)
         }
         _ => Err(EncodeError::InvalidInput(
-            "EAN-13 input must be 12 or 13 digits".into(),
+            "EAN-13 input must be 12 or 13 digits",
         )),
     }
 }
 
-/// Compute EAN-13 / EAN-8 / UPC check digit from a slice of digit values (without check).
+/// Compute EAN-13 / EAN-8 check digit from a slice of digit values (without check).
 pub(crate) fn check_digit(digits: &[u8]) -> u8 {
     // GS1 weighting is defined from the right: the rightmost data digit has
     // weight 3, then 1, alternating. Weighting from the right (rather than the
@@ -185,14 +172,14 @@ pub(crate) fn check_digit(digits: &[u8]) -> u8 {
     ((10 - (sum % 10)) % 10) as u8
 }
 
-fn encode_bars(digits: &[u8; 13]) -> Vec<bool> {
+fn encode_bars(digits: &[u8; 13], buf: &mut [bool]) -> Result<usize, EncodeError> {
     let system = digits[0] as usize;
     let parity = PARITY[system];
 
-    let mut bars: Vec<bool> = Vec::with_capacity(95);
+    let mut w = SliceWriter::new(buf);
 
     // Start guard
-    bars.extend_from_slice(&GUARD_NORMAL);
+    w.extend(GUARD_NORMAL.iter().copied())?;
 
     // Left 6 digits (digits[1]..=digits[6])
     for (pos, &d) in digits[1..=6].iter().enumerate() {
@@ -201,25 +188,21 @@ fn encode_bars(digits: &[u8; 13]) -> Vec<bool> {
         } else {
             &L_CODE[d as usize]
         };
-        bars.extend_from_slice(pattern);
+        w.extend(pattern.iter().copied())?;
     }
 
     // Centre guard
-    bars.extend_from_slice(&GUARD_CENTRE);
+    w.extend(GUARD_CENTRE.iter().copied())?;
 
     // Right 6 digits (digits[7]..=digits[12])
     for &d in &digits[7..=12] {
-        bars.extend_from_slice(&R_CODE[d as usize]);
+        w.extend(R_CODE[d as usize].iter().copied())?;
     }
 
     // End guard
-    bars.extend_from_slice(&GUARD_NORMAL);
+    w.extend(GUARD_NORMAL.iter().copied())?;
 
-    bars
-}
-
-fn format_text(digits: &[u8; 13]) -> String {
-    digits.iter().map(|d| (b'0' + d) as char).collect()
+    Ok(w.len())
 }
 
 // ---- Tests -----------------------------------------------------------------
@@ -235,38 +218,54 @@ mod tests {
         assert_eq!(check_digit(&digits), 7);
     }
 
-    #[test]
-    fn test_encode_13_digits() {
-        let out = Ean13::encode("5901234123457").unwrap();
-        match out {
-            BarcodeOutput::Linear(lb) => {
-                assert_eq!(lb.bars.len(), 95);
-                assert_eq!(lb.text.as_deref(), Some("5901234123457"));
-            }
-            _ => panic!("expected linear barcode"),
+    fn bars<'a>(input: &str, buf: &'a mut [bool]) -> &'a [bool] {
+        match Ean13::encode_into(input, buf).unwrap() {
+            Encoded::Linear { len, .. } => &buf[..len],
+            _ => panic!("expected linear"),
         }
     }
 
     #[test]
+    fn test_encode_13_digits() {
+        let mut buf = [false; 128];
+        assert_eq!(bars("5901234123457", &mut buf).len(), 95);
+    }
+
+    #[test]
     fn test_encode_12_digits_auto_check() {
-        let out12 = Ean13::encode("590123412345").unwrap();
-        let out13 = Ean13::encode("5901234123457").unwrap();
-        assert_eq!(out12, out13);
+        let mut buf12 = [false; 128];
+        let mut buf13 = [false; 128];
+        assert_eq!(
+            bars("590123412345", &mut buf12),
+            bars("5901234123457", &mut buf13)
+        );
     }
 
     #[test]
     fn test_invalid_check_digit() {
-        assert!(Ean13::encode("5901234123458").is_err());
+        let mut buf = [false; 128];
+        assert!(Ean13::encode_into("5901234123458", &mut buf).is_err());
     }
 
     #[test]
     fn test_invalid_characters() {
-        assert!(Ean13::encode("590123412345X").is_err());
+        let mut buf = [false; 128];
+        assert!(Ean13::encode_into("590123412345X", &mut buf).is_err());
     }
 
     #[test]
     fn test_wrong_length() {
-        assert!(Ean13::encode("590123").is_err());
+        let mut buf = [false; 128];
+        assert!(Ean13::encode_into("590123", &mut buf).is_err());
+    }
+
+    #[test]
+    fn test_buffer_too_small() {
+        let mut buf = [false; 32];
+        assert_eq!(
+            Ean13::encode_into("5901234123457", &mut buf),
+            Err(EncodeError::BufferTooSmall)
+        );
     }
 
     #[test]
@@ -274,6 +273,7 @@ mod tests {
         assert_eq!(Ean13::symbology_name(), "EAN-13");
     }
 
+    #[cfg(feature = "alloc")]
     #[test]
     fn test_svg_output_contains_svg_tag() {
         let svg = Ean13::encode("5901234123457").unwrap().to_svg_string();

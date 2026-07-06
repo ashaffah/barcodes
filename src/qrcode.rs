@@ -8,13 +8,10 @@
 #![allow(dead_code)]
 use core::convert::TryFrom;
 
-extern crate alloc;
-use alloc::{format, string::String, vec, vec::Vec};
+#[cfg(feature = "alloc")]
+use alloc::{format, string::String};
 
-use crate::common::{
-    traits::BarcodeEncoder,
-    types::{BarcodeOutput, MatrixBarcode},
-};
+use crate::common::{errors::EncodeError, traits::BarcodeEncoder, types::Encoded};
 
 /*---- QrCode functionality ----*/
 
@@ -422,6 +419,7 @@ impl<'a> QrCode<'a> {
     /// assert!(svg.starts_with("<svg "));
     /// assert!(svg.contains("fill=\"black\""));
     /// ```
+    #[cfg(feature = "alloc")]
     pub fn to_svg_string(&self, module_size: i32) -> String {
         assert!(module_size > 0, "module_size must be positive");
         let size = self.size();
@@ -991,11 +989,11 @@ impl Eq for QrCode<'_> {}
 
 impl BarcodeEncoder for QrCode<'_> {
     type Input = str;
-    type Error = DataTooLong;
 
-    fn encode(input: &Self::Input) -> Result<BarcodeOutput, Self::Error> {
-        let mut outbuffer = vec![0u8; Version::MAX.buffer_len()];
-        let mut tempbuffer = vec![0u8; Version::MAX.buffer_len()];
+    fn encode_into(input: &str, buf: &mut [bool]) -> Result<Encoded, EncodeError> {
+        // Fixed stack scratch sized for the largest QR version — no heap.
+        let mut outbuffer = [0u8; Version::MAX.buffer_len()];
+        let mut tempbuffer = [0u8; Version::MAX.buffer_len()];
 
         let qr = QrCode::encode_text(
             input,
@@ -1008,23 +1006,24 @@ impl BarcodeEncoder for QrCode<'_> {
                 mask: None,
                 boostecl: true,
             },
-        )?;
+        )
+        .map_err(|_| EncodeError::DataTooLong)?;
 
         let size = qr.size() as usize;
-        let mut modules = Vec::with_capacity(size);
+        let cells = size * size;
+        if buf.len() < cells {
+            return Err(EncodeError::BufferTooSmall);
+        }
         for y in 0..qr.size() {
-            let mut row = Vec::with_capacity(size);
             for x in 0..qr.size() {
-                row.push(qr.get_module(x, y));
+                buf[y as usize * size + x as usize] = qr.get_module(x, y);
             }
-            modules.push(row);
         }
 
-        Ok(BarcodeOutput::Matrix(MatrixBarcode {
-            modules,
+        Ok(Encoded::Matrix {
             width: size,
             height: size,
-        }))
+        })
     }
 
     fn symbology_name() -> &'static str {
@@ -1671,6 +1670,7 @@ mod tests {
         assert!(!QrSegment::is_alphanumeric("Hello World"));
     }
 
+    #[cfg(feature = "alloc")]
     #[test]
     fn test_qrcode_to_svg_string() {
         let mut outbuffer = alloc::vec![0u8; Version::MAX.buffer_len()];
@@ -1698,6 +1698,7 @@ mod tests {
         assert!(svg.ends_with("</svg>"));
     }
 
+    #[cfg(feature = "alloc")]
     #[test]
     fn test_qrcode_to_svg_string_custom_module_size() {
         let mut outbuffer = alloc::vec![0u8; Version::MAX.buffer_len()];
@@ -1726,15 +1727,16 @@ mod tests {
     #[test]
     fn test_qrcode_barcode_encoder() {
         use crate::common::traits::BarcodeEncoder;
-        use crate::common::types::BarcodeOutput;
+        use crate::common::types::Encoded;
 
-        let output = QrCode::encode("Hello, World!").unwrap();
-        assert!(matches!(output, BarcodeOutput::Matrix(_)));
-        if let BarcodeOutput::Matrix(matrix) = output {
-            assert!(matrix.width > 0);
-            assert_eq!(matrix.width, matrix.height);
-            assert_eq!(matrix.modules.len(), matrix.height);
-            assert_eq!(matrix.modules[0].len(), matrix.width);
+        let mut buf = [false; 177 * 177];
+        let out = QrCode::encode_into("Hello, World!", &mut buf).unwrap();
+        match out {
+            Encoded::Matrix { width, height } => {
+                assert!(width > 0);
+                assert_eq!(width, height);
+            }
+            _ => panic!("expected matrix"),
         }
         assert_eq!(QrCode::symbology_name(), "QR Code");
     }

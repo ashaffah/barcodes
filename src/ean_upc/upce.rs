@@ -13,14 +13,9 @@
 //! The parity pattern of the 6 encoded digits is determined by the check digit.
 #![forbid(unsafe_code)]
 
-extern crate alloc;
-use alloc::{format, string::String, vec::Vec};
-
 use super::ean13::{GUARD_NORMAL, L_CODE, check_digit};
 use crate::common::{
-    errors::EncodeError,
-    traits::BarcodeEncoder,
-    types::{BarcodeOutput, LinearBarcode},
+    buffer::SliceWriter, errors::EncodeError, traits::BarcodeEncoder, types::Encoded,
 };
 
 // ---- Encoding tables -------------------------------------------------------
@@ -70,30 +65,24 @@ const UPCE_PARITY: [[bool; 6]; 10] = [
 ///
 /// ```rust
 /// use barcodes::common::traits::BarcodeEncoder;
+/// use barcodes::common::types::Encoded;
 /// use barcodes::ean_upc::upce::UpcE;
 ///
+/// let mut buf = [false; 128];
 /// // 8 digits: number system + 6 data + check digit
-/// let out = UpcE::encode("01234505").unwrap();
-///
-/// // 6 digits: data only, number system 0 assumed, check digit auto-computed
-/// let out2 = UpcE::encode("123450").unwrap();
+/// let Encoded::Linear { len, .. } = UpcE::encode_into("01234505", &mut buf).unwrap()
+/// else { unreachable!() };
+/// assert_eq!(len, 51);
 /// ```
 pub struct UpcE;
 
 impl BarcodeEncoder for UpcE {
     type Input = str;
-    type Error = EncodeError;
 
-    fn encode(input: &str) -> Result<BarcodeOutput, EncodeError> {
+    fn encode_into(input: &str, buf: &mut [bool]) -> Result<Encoded, EncodeError> {
         let (number_system, six_digits, check) = parse_and_validate(input)?;
-        let bars = encode_bars(number_system, &six_digits, check);
-        let text = format_text(number_system, &six_digits, check);
-
-        Ok(BarcodeOutput::Linear(LinearBarcode {
-            bars,
-            height: 69,
-            text: Some(text),
-        }))
+        let len = encode_bars(number_system, &six_digits, check, buf)?;
+        Ok(Encoded::Linear { len, height: 69 })
     }
 
     fn symbology_name() -> &'static str {
@@ -108,7 +97,7 @@ fn parse_and_validate(input: &str) -> Result<(u8, [u8; 6], u8), EncodeError> {
     let trimmed = input.trim();
     if !trimmed.chars().all(|c| c.is_ascii_digit()) {
         return Err(EncodeError::InvalidInput(
-            "UPC-E input must contain digits only".into(),
+            "UPC-E input must contain digits only",
         ));
     }
 
@@ -134,9 +123,7 @@ fn parse_and_validate(input: &str) -> Result<(u8, [u8; 6], u8), EncodeError> {
             let upca = expand_to_upca(0, &six);
             let expected = check_digit(&upca[..11]);
             if provided_check != expected {
-                return Err(EncodeError::InvalidInput(format!(
-                    "check digit mismatch: got {provided_check}, expected {expected}"
-                )));
+                return Err(EncodeError::InvalidInput("UPC-E check digit mismatch"));
             }
             Ok((0, six, expected))
         }
@@ -149,7 +136,7 @@ fn parse_and_validate(input: &str) -> Result<(u8, [u8; 6], u8), EncodeError> {
             let ns = buf[0];
             if ns > 1 {
                 return Err(EncodeError::InvalidInput(
-                    "UPC-E number system must be 0 or 1".into(),
+                    "UPC-E number system must be 0 or 1",
                 ));
             }
             let six = [buf[1], buf[2], buf[3], buf[4], buf[5], buf[6]];
@@ -157,14 +144,12 @@ fn parse_and_validate(input: &str) -> Result<(u8, [u8; 6], u8), EncodeError> {
             let upca = expand_to_upca(ns, &six);
             let expected = check_digit(&upca[..11]);
             if provided_check != expected {
-                return Err(EncodeError::InvalidInput(format!(
-                    "check digit mismatch: got {provided_check}, expected {expected}"
-                )));
+                return Err(EncodeError::InvalidInput("UPC-E check digit mismatch"));
             }
             Ok((ns, six, expected))
         }
         _ => Err(EncodeError::InvalidInput(
-            "UPC-E input must be 6, 7, or 8 digits".into(),
+            "UPC-E input must be 6, 7, or 8 digits",
         )),
     }
 }
@@ -242,14 +227,19 @@ pub fn expand_to_upca(number_system: u8, six: &[u8; 6]) -> [u8; 12] {
     upca
 }
 
-fn encode_bars(number_system: u8, six: &[u8; 6], check: u8) -> Vec<bool> {
+fn encode_bars(
+    number_system: u8,
+    six: &[u8; 6],
+    check: u8,
+    buf: &mut [bool],
+) -> Result<usize, EncodeError> {
     // Number system 1 uses inverted parity (all G becomes L and vice versa)
     let parity = UPCE_PARITY[check as usize];
 
-    let mut bars: Vec<bool> = Vec::with_capacity(51);
+    let mut w = SliceWriter::new(buf);
 
     // Start guard: 101
-    bars.extend_from_slice(&GUARD_NORMAL);
+    w.extend(GUARD_NORMAL.iter().copied())?;
 
     // 6 data digits using L/G based on parity and number system
     for (pos, &d) in six.iter().enumerate() {
@@ -264,23 +254,13 @@ fn encode_bars(number_system: u8, six: &[u8; 6], check: u8) -> Vec<bool> {
         } else {
             &L_CODE[d as usize]
         };
-        bars.extend_from_slice(pattern);
+        w.extend(pattern.iter().copied())?;
     }
 
     // End guard: 010101
-    bars.extend_from_slice(&GUARD_END);
+    w.extend(GUARD_END.iter().copied())?;
 
-    bars
-}
-
-fn format_text(number_system: u8, six: &[u8; 6], check: u8) -> String {
-    let mut s = String::with_capacity(8);
-    s.push((b'0' + number_system) as char);
-    for &d in six.iter() {
-        s.push((b'0' + d) as char);
-    }
-    s.push((b'0' + check) as char);
-    s
+    Ok(w.len())
 }
 
 // ---- Tests -----------------------------------------------------------------
@@ -289,22 +269,23 @@ fn format_text(number_system: u8, six: &[u8; 6], check: u8) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_encode_8_digits() {
-        let out = UpcE::encode("01234505").unwrap();
-        match out {
-            BarcodeOutput::Linear(lb) => {
-                // Start(3) + 6×7=42 + End(6) = 51
-                assert_eq!(lb.bars.len(), 51);
-            }
-            _ => panic!("expected linear barcode"),
+    fn encode_len(input: &str) -> usize {
+        let mut buf = [false; 128];
+        match UpcE::encode_into(input, &mut buf).unwrap() {
+            Encoded::Linear { len, .. } => len,
+            _ => panic!("expected linear"),
         }
     }
 
     #[test]
+    fn test_encode_8_digits() {
+        // Start(3) + 6×7=42 + End(6) = 51
+        assert_eq!(encode_len("01234505"), 51);
+    }
+
+    #[test]
     fn test_encode_6_digits() {
-        let out6 = UpcE::encode("123450").unwrap();
-        assert!(matches!(out6, BarcodeOutput::Linear(_)));
+        assert!(encode_len("123450") > 0);
     }
 
     #[test]
@@ -340,17 +321,20 @@ mod tests {
 
     #[test]
     fn test_invalid_number_system() {
-        assert!(UpcE::encode("21234505").is_err());
+        let mut buf = [false; 128];
+        assert!(UpcE::encode_into("21234505", &mut buf).is_err());
     }
 
     #[test]
     fn test_invalid_characters() {
-        assert!(UpcE::encode("0123450X").is_err());
+        let mut buf = [false; 128];
+        assert!(UpcE::encode_into("0123450X", &mut buf).is_err());
     }
 
     #[test]
     fn test_wrong_length() {
-        assert!(UpcE::encode("12345").is_err());
+        let mut buf = [false; 128];
+        assert!(UpcE::encode_into("12345", &mut buf).is_err());
     }
 
     #[test]
@@ -358,6 +342,7 @@ mod tests {
         assert_eq!(UpcE::symbology_name(), "UPC-E");
     }
 
+    #[cfg(feature = "alloc")]
     #[test]
     fn test_svg_output() {
         let svg = UpcE::encode("01234505").unwrap().to_svg_string();
