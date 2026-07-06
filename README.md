@@ -14,7 +14,7 @@ Zero external dependencies, `no_std` compatible (requires `alloc`).
 - `no_std` compatible (requires `alloc`)
 - SVG output built-in (`to_svg_string()`)
 - Optional image output (PNG, GIF, WebP) via `image` feature
-- Supports 15+ barcode symbologies: linear, 2D, and postal
+- Supports 16+ barcode symbologies: linear, 2D, and postal
 
 ## Installation
 
@@ -45,6 +45,8 @@ barcodes = { version = "0.1", features = ["image"] }
 | UPC-E                       | `barcodes::ean_upc::upce`    | ✅     |
 | Code 128 (A/B/C)            | `barcodes::linear::code128`  | ✅     |
 | Code 39                     | `barcodes::linear::code39`   | ✅     |
+| Code 93                     | `barcodes::linear::code93`   | ✅     |
+| Codabar (NW-7)              | `barcodes::linear::codabar`  | ✅     |
 | ITF (Interleaved 2 of 5)    | `barcodes::linear::itf`      | ✅     |
 | GS1-128                     | `barcodes::gs1::gs1_128`     | ✅     |
 | GS1 DataBar Omnidirectional | `barcodes::gs1::databar`     | ✅     |
@@ -121,6 +123,29 @@ use barcodes::common::traits::BarcodeEncoder;
 use barcodes::linear::code39::Code39;
 
 let output = Code39::encode("HELLO WORLD").unwrap();
+let svg = output.to_svg_string();
+println!("{svg}");
+```
+
+### Code 93
+
+```rust
+use barcodes::common::traits::BarcodeEncoder;
+use barcodes::linear::code93::Code93;
+
+let output = Code93::encode("CODE93").unwrap();
+let svg = output.to_svg_string();
+println!("{svg}");
+```
+
+### Codabar (NW-7)
+
+```rust
+use barcodes::common::traits::BarcodeEncoder;
+use barcodes::linear::codabar::Codabar;
+
+// Digits and -$:/.+ ; A/B start/stop guards are added automatically
+let output = Codabar::encode("1234567").unwrap();
 let svg = output.to_svg_string();
 println!("{svg}");
 ```
@@ -287,7 +312,7 @@ Image output (`to_image()`) requires the `image` feature, which implies `std`.
 | `barcodes::common`  | Shared traits, types, errors, and output helpers |
 | `barcodes::qrcode`  | QR Code Model 2 encoder                          |
 | `barcodes::ean_upc` | EAN-13, EAN-8, UPC-A, UPC-E                      |
-| `barcodes::linear`  | Code 128, Code 39, ITF                           |
+| `barcodes::linear`  | Code 128, Code 39, Code 93, Codabar, ITF         |
 | `barcodes::gs1`     | GS1-128, GS1 DataBar                             |
 | `barcodes::twod`    | PDF417, Data Matrix, Aztec Code                  |
 | `barcodes::postal`  | USPS IMb, Royal Mail RM4SCC                      |
