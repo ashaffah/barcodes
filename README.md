@@ -238,9 +238,9 @@ println!("{svg}");
 
 ```rust
 use barcodes::common::traits::BarcodeEncoder;
-use barcodes::gs1::databar::GS1DataBar;
+use barcodes::gs1::databar::DataBar;
 
-let output = GS1DataBar::encode("0950110153001").unwrap();
+let output = DataBar::encode("0950110153001").unwrap();
 let svg = output.to_svg_string();
 println!("{svg}");
 ```
