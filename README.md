@@ -105,6 +105,26 @@ which streams into any `core::fmt::Write` sink.
 
 ### QR Code
 
+QR implements [`BarcodeEncoder`](#zero-allocation-core) like every other
+symbology, so the uniform zero-allocation API works too (defaults: ECC Medium,
+automatic version and mask):
+
+```rust
+use barcodes::common::traits::BarcodeEncoder;
+use barcodes::common::types::Encoded;
+use barcodes::qrcode::QrCode;
+
+let mut buf = [false; 177 * 177]; // fits the largest QR (version 40)
+let Encoded::Matrix { width, height } =
+    QrCode::encode_into("https://example.com", &mut buf).unwrap()
+else { unreachable!() };
+// buf[y * width + x] == true → dark module
+let _ = height;
+```
+
+Use `encode_text` directly when you need to control the error-correction level,
+version range, or mask:
+
 ```rust
 use barcodes::qrcode::{QrCode, QrCodeEcc, Version, EncodeTextOptions};
 
