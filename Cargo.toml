@@ -8,7 +8,7 @@ categories = ["encoding", "no-std"]
 license = "MIT"
 repository = "https://github.com/ashaffah/barcodes"
 readme = "README.md"
-exclude = ["/examples", "/generated_barcodes"]
+exclude = ["/examples", "/generated_barcodes", ".github"]
 
 [features]
 default = []
