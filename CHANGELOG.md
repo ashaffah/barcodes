@@ -5,6 +5,17 @@ All notable changes to this project are documented here. The format is based on
 [Semantic Versioning](https://semver.org/) (with `0.x` minor bumps signalling
 breaking changes).
 
+## [0.2.2] — 2026-07-23
+
+### Changed
+
+- **Fully fluid SVG.** The generated `<svg>` no longer sets fixed `width`/`height`
+  attributes — only a `viewBox` (plus `style="max-width:100%;height:auto"`) — so it
+  has no intrinsic pixel size and scales to fill its container's width while
+  preserving aspect ratio. This refines the 0.2.1 behavior (which kept the intrinsic
+  size and only shrank). Callers wanting a fixed size set it via CSS or a wrapper,
+  e.g. `svg { width: 300px; height: auto; }`.
+
 ## [0.2.1] — 2026-07-23
 
 ### Added
@@ -133,6 +144,7 @@ else { unreachable!() };
 let bars = &buf[..len]; // true = dark module
 ```
 
+[0.2.2]: https://github.com/ashaffah/barcodes/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/ashaffah/barcodes/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/ashaffah/barcodes/compare/v0.1.3...v0.2.0
 [0.1.3]: https://github.com/ashaffah/barcodes/compare/v0.1.2...v0.1.3
