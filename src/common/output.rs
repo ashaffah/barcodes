@@ -16,11 +16,6 @@ impl BarcodeOutput {
     /// quiet zone is added on every side.  Linear barcodes with a `text` label
     /// render it centered beneath the bars.
     ///
-    /// The `<svg>` carries a `viewBox` plus `style="max-width:100%;height:auto"`,
-    /// so it keeps its intrinsic pixel size but scales down to fit a narrower
-    /// container while preserving aspect ratio. To let it grow to fill a wider
-    /// container instead, override with CSS (e.g. `svg { width: 100%; height: auto; }`).
-    ///
     /// This is a thin `alloc` wrapper over the allocation-free writers in
     /// [`crate::common::svg`].
     ///
@@ -82,7 +77,7 @@ fn write_matrix(out: &mut String, mb: &super::types::MatrixBarcode) -> core::fmt
 
     write!(
         out,
-        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{px_width}" height="{px_height}" viewBox="0 0 {px_width} {px_height}" style="max-width:100%;height:auto"><rect width="{px_width}" height="{px_height}" fill="white"/>"#,
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{px_width}" height="{px_height}" viewBox="0 0 {px_width} {px_height}"><rect width="{px_width}" height="{px_height}" fill="white"/>"#,
     )?;
     for (row_idx, row) in mb.modules.iter().enumerate() {
         for (col_idx, &dark) in row.iter().enumerate() {
