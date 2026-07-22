@@ -31,7 +31,7 @@ pub fn write_linear<W: Write>(bars: &[bool], height: u32, out: &mut W) -> fmt::R
 
     write!(
         out,
-        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{total_width}" height="{total_height}" viewBox="0 0 {total_width} {total_height}"><rect width="{total_width}" height="{total_height}" fill="white"/>"#,
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{total_width}" height="{total_height}" viewBox="0 0 {total_width} {total_height}" style="max-width:100%;height:auto"><rect width="{total_width}" height="{total_height}" fill="white"/>"#,
     )?;
     for (i, &dark) in bars.iter().enumerate() {
         if dark {
@@ -53,7 +53,7 @@ pub fn write_matrix<W: Write>(modules: &[bool], width: usize, out: &mut W) -> fm
 
     write!(
         out,
-        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{px_width}" height="{px_height}" viewBox="0 0 {px_width} {px_height}"><rect width="{px_width}" height="{px_height}" fill="white"/>"#,
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{px_width}" height="{px_height}" viewBox="0 0 {px_width} {px_height}" style="max-width:100%;height:auto"><rect width="{px_width}" height="{px_height}" fill="white"/>"#,
     )?;
     for (idx, &dark) in modules.iter().enumerate() {
         if dark {
@@ -109,6 +109,9 @@ mod tests {
         let svg = w.as_str();
         assert!(svg.starts_with("<svg "));
         assert!(svg.ends_with("</svg>"));
+        // Responsive: scales down to the container while keeping aspect ratio.
+        assert!(svg.contains(r#"style="max-width:100%;height:auto""#));
+        assert!(svg.contains("viewBox="));
     }
 
     #[test]
@@ -117,6 +120,8 @@ mod tests {
         let modules = [true, false, false, true];
         let mut w = FixedWriter::new();
         write_matrix(&modules, 2, &mut w).unwrap();
-        assert!(w.as_str().starts_with("<svg "));
+        let svg = w.as_str();
+        assert!(svg.starts_with("<svg "));
+        assert!(svg.contains(r#"style="max-width:100%;height:auto""#));
     }
 }
