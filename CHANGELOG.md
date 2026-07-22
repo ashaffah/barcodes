@@ -5,6 +5,26 @@ All notable changes to this project are documented here. The format is based on
 [Semantic Versioning](https://semver.org/) (with `0.x` minor bumps signalling
 breaking changes).
 
+## [0.2.1] — 2026-07-23
+
+### Added
+
+- **Responsive SVG output.** Every generated `<svg>` now carries
+  `style="max-width:100%;height:auto"` alongside its `viewBox`, so the symbol
+  keeps its intrinsic size but scales down to fit a narrower container while
+  preserving aspect ratio. Override with CSS (`svg { width: 100%; height: auto; }`)
+  to grow into wider containers.
+
+### Docs
+
+- Document that QR Code is usable through the uniform
+  [`BarcodeEncoder::encode_into`](https://docs.rs/barcodes/latest/barcodes/common/traits/trait.BarcodeEncoder.html)
+  API (with default ECC/version/mask), in addition to `QrCode::encode_text`.
+
+### Packaging
+
+- Exclude `.github/` from the published crate.
+
 ## [0.2.0] — 2026-07-07
 
 ### Breaking
@@ -113,6 +133,7 @@ else { unreachable!() };
 let bars = &buf[..len]; // true = dark module
 ```
 
+[0.2.1]: https://github.com/ashaffah/barcodes/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/ashaffah/barcodes/compare/v0.1.3...v0.2.0
 [0.1.3]: https://github.com/ashaffah/barcodes/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/ashaffah/barcodes/compare/v0.1.1...v0.1.2
