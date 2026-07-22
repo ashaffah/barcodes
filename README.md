@@ -71,10 +71,10 @@ let _ = height;
 Render to SVG without allocating via [`common::svg`](https://docs.rs/barcodes/latest/barcodes/common/svg/index.html),
 which streams into any `core::fmt::Write` sink.
 
-The generated SVG has a `viewBox` and `style="max-width:100%;height:auto"` but no
-fixed `width`/`height`, so it has no intrinsic size and scales to fill its
-container's width while preserving aspect ratio. To pin a fixed size, set it via
-CSS or a wrapper — e.g. `svg { width: 300px; height: auto; }`.
+The generated SVG has a `viewBox` and `style="max-width:100%;height:auto"`, so it
+keeps its intrinsic size but scales **down** to fit a narrower container while
+preserving aspect ratio. To let it grow to fill a wider container, override with
+CSS — `svg { width: 100%; height: auto; }`.
 
 > The `alloc` feature adds the convenience `Encoder::encode()` (returning an
 > owned `BarcodeOutput`) and `.to_svg_string()`. The examples below use it.

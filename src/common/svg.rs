@@ -31,7 +31,7 @@ pub fn write_linear<W: Write>(bars: &[bool], height: u32, out: &mut W) -> fmt::R
 
     write!(
         out,
-        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {total_width} {total_height}" style="max-width:100%;height:auto"><rect width="{total_width}" height="{total_height}" fill="white"/>"#,
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{total_width}" height="{total_height}" viewBox="0 0 {total_width} {total_height}" style="max-width:100%;height:auto"><rect width="{total_width}" height="{total_height}" fill="white"/>"#,
     )?;
     for (i, &dark) in bars.iter().enumerate() {
         if dark {
@@ -53,7 +53,7 @@ pub fn write_matrix<W: Write>(modules: &[bool], width: usize, out: &mut W) -> fm
 
     write!(
         out,
-        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {px_width} {px_height}" style="max-width:100%;height:auto"><rect width="{px_width}" height="{px_height}" fill="white"/>"#,
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{px_width}" height="{px_height}" viewBox="0 0 {px_width} {px_height}" style="max-width:100%;height:auto"><rect width="{px_width}" height="{px_height}" fill="white"/>"#,
     )?;
     for (idx, &dark) in modules.iter().enumerate() {
         if dark {
@@ -109,13 +109,13 @@ mod tests {
         let svg = w.as_str();
         assert!(svg.starts_with("<svg "));
         assert!(svg.ends_with("</svg>"));
-        // Responsive: no fixed size on the <svg> tag; sizing comes from viewBox
-        // + the container. (The background <rect> still has width/height.)
+        // Intrinsic size (width/height) for a sensible default, plus viewBox and
+        // max-width:100% so it also scales down to fit a narrower container.
         assert!(svg.contains(r#"style="max-width:100%;height:auto""#));
         assert!(svg.contains("viewBox="));
         let open_tag = &svg[..svg.find('>').unwrap()];
-        assert!(!open_tag.contains("width="), "svg tag must not set width");
-        assert!(!open_tag.contains("height="), "svg tag must not set height");
+        assert!(open_tag.contains("width="), "svg tag must set width");
+        assert!(open_tag.contains("height="), "svg tag must set height");
     }
 
     #[test]
